@@ -1,0 +1,12 @@
+# personal settings (contains Telegram bot token) and runtime output
+settings.ini
+logs/
+render_logs/
+
+# build output
+*.exe
+dist/
+
+# local legacy files with personal paths
+run_render.bat
+Text Document.txt
