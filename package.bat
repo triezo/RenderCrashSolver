@@ -2,7 +2,7 @@
 :: Builds a shareable test package: dist\RenderCrashSolver\ (exe + script + README) and dist\RenderCrashSolver_<ver>.zip
 :: Your settings.ini and logs are NOT included. Telegram is left out of this build.
 setlocal
-set VERSION=0.1
+set VERSION=0.2
 set ROOT=%~dp0
 set OUT=%ROOT%dist\RenderCrashSolver
 set ZIP=%ROOT%dist\RenderCrashSolver_%VERSION%.zip

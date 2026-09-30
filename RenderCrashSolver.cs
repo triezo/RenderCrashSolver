@@ -164,7 +164,7 @@ namespace RenderCrashSolver
 
     class MainForm : Form
     {
-        const string AppTitle = "RenderCrashSolver 0.1";
+        const string AppTitle = "RenderCrashSolver 0.2";
 #if TELEGRAM
         static readonly bool TelegramFeature = true;
 #else
@@ -172,7 +172,8 @@ namespace RenderCrashSolver
         static readonly bool TelegramFeature = false;
 #endif
         const string ScriptTag = "[resume_render] ";
-        const int ScriptErrorExitCode = 2;
+        const int ScriptErrorExitCode = 2;   // unexpected Python error in resume_render.py: stop, retrying won't help
+        const int RenderErrorExitCode = 3;   // render failed inside Blender (GPU/CUDA): retry like a crash
 
         [DllImport("kernel32.dll")]
         static extern uint SetThreadExecutionState(uint flags);
@@ -826,7 +827,10 @@ namespace RenderCrashSolver
             else if (code != 0)
             {
                 crashes++;
-                AddUi(string.Format("Blender упал: код {0} (0x{0:X8}).", code));
+                if (code == RenderErrorExitCode)
+                    AddUi("Рендер прервался с ошибкой внутри Blender (чаще всего сбой видеокарты / CUDA).");
+                else
+                    AddUi(string.Format("Blender упал: код {0} (0x{0:X8}).", code));
                 if (settings.TgOnCrash && attempt < settings.MaxRetries)
                     NotifyTelegram(string.Format("⚠ Blender упал (код 0x{0:X8}), перезапуск через {1} с — попытка {2} из {3}.",
                         code, settings.RetryPauseSec, attempt + 1, settings.MaxRetries), false);

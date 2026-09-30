@@ -45,6 +45,10 @@ FRAME_END_OVERRIDE = None
 
 TAG = "[resume_render]"
 
+# exit code when the render itself fails inside Blender (GPU/CUDA errors etc.);
+# the GUI and run_render.bat restart Blender, same as after a crash
+RENDER_ERROR_EXIT_CODE = 3
+
 
 def log(msg):
     # flush so the GUI sees progress immediately even when stdout is a pipe
@@ -213,7 +217,16 @@ def main():
     bpy.app.handlers.render_pre.append(on_render_pre)
     bpy.app.handlers.render_write.append(on_render_write)
 
-    bpy.ops.render.render(animation=True)
+    try:
+        bpy.ops.render.render(animation=True)
+    except RuntimeError as e:
+        # Cycles reports GPU failures (e.g. CUDA "Illegal address") as an exception, not a crash.
+        # Exit hard with a dedicated code: the GPU context is broken, a fresh Blender has to continue.
+        message = str(e).strip().splitlines()
+        log(f"RENDER_ERROR {message[0] if message else repr(e)}")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(RENDER_ERROR_EXIT_CODE)
 
     still_missing = sorted(full_range - find_rendered_frames(output_dir, pattern, ext))
     if still_missing:

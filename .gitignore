@@ -10,3 +10,6 @@ dist/
 # local legacy files with personal paths
 run_render.bat
 Text Document.txt
+
+# python bytecode
+__pycache__/
