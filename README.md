@@ -33,6 +33,10 @@
 | `build.bat` | Собирает `RenderCrashSolver.exe` рядом с исходниками (с уведомлениями в Telegram, `/define:TELEGRAM`). |
 | `package.bat` | Собирает тестовую сборку в `dist\RenderCrashSolver\` и zip-архив для раздачи (без Telegram). |
 
+## Разработка
+
+Архитектура, протокол между программой и Blender, коды выхода, выпуск версий, что проверено и что нет — в [DEVELOPMENT.md](DEVELOPMENT.md).
+
 ## Устройство
 
 | Файл | Роль |
