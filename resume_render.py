@@ -2,20 +2,22 @@
 resume_render.py - resume animation render after a Blender crash.
 
 Called by RenderCrashSolver.exe or run_render.bat via:
-blender -b file.blend -P resume_render.py [-- --output-dir DIR] [--prefix NAME]
+blender -b file.blend -P resume_render.py [-- --output-dir DIR] [--prefix NAME] [--override-since UNIX_TS]
 blender -b file.blend -P resume_render.py -- --info   (only print SCENE_* lines, no render)
 
 Logic:
-- Optionally overrides the output path (folder and/or file name prefix) of the scene
+- Optionally renders to a different output folder and/or file name prefix (custom output)
 - Scans the output folder for already-rendered frame files with that prefix
 - Broken frames (empty / truncated JPG or PNG) are renamed to *.broken and re-rendered
 - Renders the missing frames; existing frames are skipped (no overwrite),
   so holes in the middle of the range do not cause re-rendering of finished frames
+- Override (--override-since): re-render everything. Frames saved before that time count as stale
+  and are overwritten; frames saved after it belong to this re-render, so a crash resumes it
 - Prints ALL_FRAMES_DONE when every frame of the range is on disk
 
 Machine-readable lines for the GUI (all start with "[resume_render] "):
   OUTPUT_EXT <ext>
-  OUTPUT_PATH <scene.render.filepath, absolute, after override>
+  OUTPUT_PATH <scene.render.filepath, absolute, custom output applied>
   OUTPUT_DIR <path>
   STATUS total=<n> done=<n> missing=<n>
   FRAME_START <frame>
@@ -59,26 +61,30 @@ def parse_args():
     # Blender ignores everything after "--", so our own options go there
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     parser = argparse.ArgumentParser(prog="resume_render.py")
-    parser.add_argument("--output-dir", help="folder for rendered frames (overrides the scene)")
-    parser.add_argument("--prefix", help="file name prefix, e.g. shot_ (overrides the scene)")
+    parser.add_argument("--output-dir", help="folder for rendered frames (instead of the scene path)")
+    parser.add_argument("--prefix", help="file name prefix, e.g. shot_ (instead of the scene name)")
+    parser.add_argument("--override-since", type=float,
+                        help="re-render all frames: files saved before this unix time are stale and get overwritten")
     parser.add_argument("--info", action="store_true", help="only print the scene output settings, do not render")
     return parser.parse_args(argv)
 
 
-def apply_output_override(scene, args):
+def apply_custom_output(scene, args):
     if not args.output_dir and args.prefix is None:
         return
     current = bpy.path.abspath(scene.render.filepath)
     folder = args.output_dir or os.path.dirname(current)
     prefix = args.prefix if args.prefix is not None else os.path.basename(current)
     scene.render.filepath = os.path.join(folder, prefix)
-    log(f"Output path overridden: {scene.render.filepath}")
+    log(f"Custom output path: {scene.render.filepath}")
 
 
 def get_output_dir(scene):
     if OUTPUT_DIR:
         return bpy.path.abspath(OUTPUT_DIR)
-    return bpy.path.abspath(os.path.dirname(scene.render.filepath))
+    # abspath first: Blender stores relative paths as "//render\shot_", and ntpath.dirname
+    # treats a leading "//" as a UNC share, returning the whole string as the "directory"
+    return os.path.dirname(bpy.path.abspath(scene.render.filepath))
 
 
 def get_file_ext(scene):
@@ -124,7 +130,12 @@ def is_complete(path, ext):
     return True
 
 
-def find_rendered_frames(output_dir, pattern, ext, fix_broken=True):
+def find_rendered_frames(output_dir, pattern, ext, fix_broken=True, stale_before=None, stale=None):
+    """Frame numbers with a complete file on disk.
+
+    stale_before (Override): files saved before this unix time don't count as rendered;
+    their frame numbers are collected into the optional `stale` set instead.
+    """
     if not os.path.isdir(output_dir):
         return set()
 
@@ -135,7 +146,11 @@ def find_rendered_frames(output_dir, pattern, ext, fix_broken=True):
             continue
         path = os.path.join(output_dir, fname)
         if is_complete(path, ext):
-            rendered.add(int(match.group(1)))
+            if stale_before is not None and os.path.getmtime(path) < stale_before:
+                if stale is not None:
+                    stale.add(int(match.group(1)))
+            else:
+                rendered.add(int(match.group(1)))
         elif fix_broken:
             broken = path + ".broken"
             try:
@@ -188,7 +203,7 @@ def main():
     full_range = set(range(frame_start, frame_end + 1))
 
     if args.info:
-        # read-only query for the GUI: the scene's own output path, before any override
+        # read-only query for the GUI: the scene's own output path, before a custom output is applied
         ext = get_file_ext(scene)
         log(f"SCENE_PATH {bpy.path.abspath(scene.render.filepath)}")
         log(f"SCENE_FRAMES {frame_start} {frame_end}")
@@ -199,8 +214,9 @@ def main():
             log(f"STATUS total={len(full_range)} done={len(rendered)} missing={len(full_range) - len(rendered)}")
         return
 
-    apply_output_override(scene, args)
+    apply_custom_output(scene, args)
     output_dir = get_output_dir(scene)
+    override_since = args.override_since
     ext = get_file_ext(scene)
 
     if ext is None:
@@ -214,10 +230,15 @@ def main():
     log(f"OUTPUT_PATH {bpy.path.abspath(scene.render.filepath)}")
     log(f"OUTPUT_DIR {output_dir}")
 
-    rendered = find_rendered_frames(output_dir, pattern, ext) & full_range
+    stale = set()
+    rendered = find_rendered_frames(output_dir, pattern, ext, stale_before=override_since, stale=stale) & full_range
     missing = sorted(full_range - rendered)
     log(f"STATUS total={len(full_range)} done={len(rendered)} missing={len(missing)}")
     describe_existing(output_dir, pattern, rendered)
+    if override_since is not None:
+        since = time.strftime('%Y-%m-%d %H:%M', time.localtime(override_since))
+        log(f"Override: re-rendering all frames; {len(stale & full_range)} files saved before {since} "
+            f"will be overwritten, {len(rendered)} already re-rendered")
 
     if not missing:
         log("ALL_FRAMES_DONE - all frames already rendered.")
@@ -228,8 +249,10 @@ def main():
 
     scene.frame_start = resume_from
     scene.frame_end = frame_end
-    # skip frames that already exist on disk instead of overwriting them
-    scene.render.use_overwrite = False
+    # normally: skip frames that already exist on disk instead of overwriting them.
+    # Override: stale files must be overwritten. The re-render goes in order, so every frame from
+    # resume_from on is stale or missing and nothing re-rendered in this session gets redone.
+    scene.render.use_overwrite = override_since is not None
     scene.render.use_placeholder = False
 
     bpy.app.handlers.render_pre.append(on_render_pre)
@@ -246,7 +269,7 @@ def main():
         sys.stderr.flush()
         os._exit(RENDER_ERROR_EXIT_CODE)
 
-    still_missing = sorted(full_range - find_rendered_frames(output_dir, pattern, ext))
+    still_missing = sorted(full_range - find_rendered_frames(output_dir, pattern, ext, stale_before=override_since))
     if still_missing:
         log(f"Render finished but {len(still_missing)} frames are still missing (first: {still_missing[0]}).")
     else:

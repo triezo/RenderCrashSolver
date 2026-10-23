@@ -39,7 +39,12 @@ namespace RenderCrashSolver
         public string LogDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
         public string OutputDir = "";     // empty = keep scene.render.filepath directory
         public string OutputPrefix = "";  // empty = keep scene file name prefix
-        public bool OverrideOutput = false;
+        public bool CustomOutput = false;
+        // Override: re-render every frame, overwriting existing files. Frames saved before OverrideSince
+        // (unix seconds, set at the first Start) count as stale, so crashes / Stop / reboot resume the re-render.
+        public bool Override = false;
+        public long OverrideSince = 0;
+        public string OverrideKey = "";   // blend + output the OverrideSince belongs to
         public int MaxRetries = 50;
         public int RetryPauseSec = 10;
         public int HangTimeoutMin = 60;
@@ -114,7 +119,11 @@ namespace RenderCrashSolver
                         case "LogDir": s.LogDir = val; break;
                         case "OutputDir": s.OutputDir = val; break;
                         case "OutputPrefix": s.OutputPrefix = val; break;
-                        case "OverrideOutput": s.OverrideOutput = val == "1"; break;
+                        case "CustomOutput":
+                        case "OverrideOutput": /* name used up to 0.3 */ s.CustomOutput = val == "1"; break;
+                        case "Override": s.Override = val == "1"; break;
+                        case "OverrideSince": long since; if (long.TryParse(val, out since)) s.OverrideSince = since; break;
+                        case "OverrideKey": s.OverrideKey = val; break;
                         case "MaxRetries": if (int.TryParse(val, out n)) s.MaxRetries = n; break;
                         case "RetryPauseSec": if (int.TryParse(val, out n)) s.RetryPauseSec = n; break;
                         case "HangTimeoutMin": if (int.TryParse(val, out n)) s.HangTimeoutMin = n; break;
@@ -143,7 +152,10 @@ namespace RenderCrashSolver
                     "LogDir=" + LogDir,
                     "OutputDir=" + OutputDir,
                     "OutputPrefix=" + OutputPrefix,
-                    "OverrideOutput=" + (OverrideOutput ? "1" : "0"),
+                    "CustomOutput=" + (CustomOutput ? "1" : "0"),
+                    "Override=" + (Override ? "1" : "0"),
+                    "OverrideSince=" + OverrideSince,
+                    "OverrideKey=" + OverrideKey,
                     "MaxRetries=" + MaxRetries,
                     "RetryPauseSec=" + RetryPauseSec,
                     "HangTimeoutMin=" + HangTimeoutMin,
@@ -164,7 +176,7 @@ namespace RenderCrashSolver
 
     class MainForm : Form
     {
-        const string AppTitle = "RenderCrashSolver 0.3";
+        const string AppTitle = "RenderCrashSolver 0.4";
 #if TELEGRAM
         static readonly bool TelegramFeature = true;
 #else
@@ -183,7 +195,7 @@ namespace RenderCrashSolver
         Settings settings;
 
         TextBox txtBlender, txtBlend, txtOutputDir, txtOutputPrefix, txtLogDir, txtLog;
-        CheckBox chkOverride;
+        CheckBox chkCustomOutput, chkOverride;
         Label lblScenePath, lblEffectivePath;
         Button btnSceneRefresh, btnOutputBrowse;
 
@@ -299,7 +311,7 @@ namespace RenderCrashSolver
             {
                 BrowseFile(txtBlend, "Blender scene (*.blend)|*.blend");
             });
-            // output: the scene's own path is primary, the override is optional
+            // output: the scene's own path is primary, a different output folder is optional
             tbl.Controls.Add(new Label { Text = "Вывод (сцена)", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 6, 8, 3) }, 0, 2);
             lblScenePath = new Label { AutoSize = false, Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft, Height = txtBlend.Height + 4, Margin = new Padding(3, 2, 3, 2), Text = "—" };
             tbl.Controls.Add(lblScenePath, 1, 2);
@@ -309,10 +321,10 @@ namespace RenderCrashSolver
             tbl.Controls.Add(btnSceneRefresh, 2, 2);
             settingsControls.Add(btnSceneRefresh);
 
-            chkOverride = new CheckBox { Text = "Свой путь вывода (вместо пути из сцены; .blend не изменяется)", AutoSize = true, Checked = settings.OverrideOutput, Margin = new Padding(3, 4, 3, 2) };
-            tbl.Controls.Add(chkOverride, 0, 3);
-            tbl.SetColumnSpan(chkOverride, 3);
-            settingsControls.Add(chkOverride);
+            chkCustomOutput = new CheckBox { Text = "Другая папка вывода (вместо пути из сцены; .blend не изменяется)", AutoSize = true, Checked = settings.CustomOutput, Margin = new Padding(3, 4, 3, 2) };
+            tbl.Controls.Add(chkCustomOutput, 0, 3);
+            tbl.SetColumnSpan(chkCustomOutput, 3);
+            settingsControls.Add(chkCustomOutput);
 
             txtOutputDir = AddPathRow(tbl, 4, "   Папка", settings.OutputDir, delegate
             {
@@ -326,10 +338,10 @@ namespace RenderCrashSolver
             tbl.Controls.Add(lblEffectivePath, 1, 6);
             tbl.SetColumnSpan(lblEffectivePath, 2);
 
-            chkOverride.CheckedChanged += delegate
+            chkCustomOutput.CheckedChanged += delegate
             {
                 // prefill with the scene values so the user edits from what Blender uses
-                if (chkOverride.Checked && txtOutputDir.Text.Length == 0 && txtOutputPrefix.Text.Length == 0 && sceneFilepath != null)
+                if (chkCustomOutput.Checked && txtOutputDir.Text.Length == 0 && txtOutputPrefix.Text.Length == 0 && sceneFilepath != null)
                 {
                     txtOutputDir.Text = Path.GetDirectoryName(sceneFilepath);
                     txtOutputPrefix.Text = Path.GetFileName(sceneFilepath);
@@ -341,7 +353,19 @@ namespace RenderCrashSolver
             txtBlend.TextChanged += delegate { sceneInfoDueAt = DateTime.Now.AddMilliseconds(800); };
             txtBlender.TextChanged += delegate { sceneInfoDueAt = DateTime.Now.AddMilliseconds(800); };
 
-            txtLogDir = AddPathRow(tbl, 7, "Папка логов", settings.LogDir, delegate
+            chkOverride = new CheckBox { AutoSize = true, Checked = settings.Override, Margin = new Padding(3, 6, 3, 4) };
+            chkOverride.CheckedChanged += delegate
+            {
+                // unticking cancels a re-render in progress: from then on existing frames count as done again
+                if (!chkOverride.Checked) { settings.OverrideSince = 0; settings.OverrideKey = ""; }
+                UpdateOverrideText();
+            };
+            tbl.Controls.Add(chkOverride, 0, 7);
+            tbl.SetColumnSpan(chkOverride, 3);
+            settingsControls.Add(chkOverride);
+            UpdateOverrideText();
+
+            txtLogDir = AddPathRow(tbl, 8, "Папка логов", settings.LogDir, delegate
             {
                 BrowseFolder(txtLogDir);
             });
@@ -350,7 +374,7 @@ namespace RenderCrashSolver
             numRetries = AddNumber(flow, "Макс. попыток", 1, 1000, settings.MaxRetries);
             numPause = AddNumber(flow, "Пауза перед перезапуском, с", 0, 600, settings.RetryPauseSec);
             numHang = AddNumber(flow, "Перезапуск, если нет нового кадра, мин (0 = выкл.)", 0, 1440, settings.HangTimeoutMin);
-            tbl.Controls.Add(flow, 0, 8);
+            tbl.Controls.Add(flow, 0, 9);
             tbl.SetColumnSpan(flow, 3);
             root.Controls.Add(grpSettings, 0, 0);
 
@@ -517,13 +541,13 @@ namespace RenderCrashSolver
 
         void UpdateOutputUi()
         {
-            bool editable = chkOverride.Enabled && chkOverride.Checked;
+            bool editable = chkCustomOutput.Enabled && chkCustomOutput.Checked;
             txtOutputDir.Enabled = editable;
             btnOutputBrowse.Enabled = editable;
             txtOutputPrefix.Enabled = editable;
 
             string effective = EffectiveOutputPath();
-            if (!chkOverride.Checked)
+            if (!chkCustomOutput.Checked)
                 lblEffectivePath.Text = "";
             else if (effective == null)
                 lblEffectivePath.Text = "Кадры будут сохраняться в: (прочитайте сцену кнопкой ↻)";
@@ -535,11 +559,11 @@ namespace RenderCrashSolver
                 preview.SetSequence(effective, sceneExt);
         }
 
-        // scene.render.filepath with the optional override applied; null while the scene is unknown
+        // scene.render.filepath with the optional custom output applied; null while the scene is unknown
         string EffectiveOutputPath()
         {
             string dir = "", prefix = "";
-            if (chkOverride.Checked)
+            if (chkCustomOutput.Checked)
             {
                 dir = txtOutputDir.Text.Trim().Trim('"').TrimEnd('\\', '/');
                 prefix = txtOutputPrefix.Text.Trim();
@@ -671,7 +695,8 @@ namespace RenderCrashSolver
             // trailing backslash would escape the closing quote on the command line
             settings.OutputDir = txtOutputDir.Text.Trim().Trim('"').TrimEnd('\\', '/');
             settings.OutputPrefix = txtOutputPrefix.Text.Trim();
-            settings.OverrideOutput = chkOverride.Checked;
+            settings.CustomOutput = chkCustomOutput.Checked;
+            settings.Override = chkOverride.Checked;
             settings.LogDir = txtLogDir.Text.Trim().Trim('"');
             settings.MaxRetries = (int)numRetries.Value;
             settings.RetryPauseSec = (int)numPause.Value;
@@ -688,15 +713,15 @@ namespace RenderCrashSolver
             else if (!File.Exists(ScriptPath))
                 error = "Рядом с программой не найден resume_render.py:\n" + ScriptPath +
                         "\n\nЕсли программа запущена прямо из zip-архива — распакуйте архив целиком в обычную папку и запустите оттуда.";
-            else if (settings.OverrideOutput && settings.OutputDir.Length > 0 && !Path.IsPathRooted(settings.OutputDir))
+            else if (settings.CustomOutput && settings.OutputDir.Length > 0 && !Path.IsPathRooted(settings.OutputDir))
                 error = "Папка вывода должна быть полным путём, например E:\\Render\\shot01";
-            else if (settings.OverrideOutput && (settings.OutputPrefix.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || settings.OutputPrefix.Contains("\"")))
+            else if (settings.CustomOutput && (settings.OutputPrefix.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || settings.OutputPrefix.Contains("\"")))
                 error = "Имя файла содержит недопустимые символы: " + settings.OutputPrefix;
             else
             {
                 try { Directory.CreateDirectory(settings.LogDir); }
                 catch (Exception ex) { error = "Не удалось создать папку логов:\n" + ex.Message; }
-                if (error == null && settings.OverrideOutput && settings.OutputDir.Length > 0)
+                if (error == null && settings.CustomOutput && settings.OutputDir.Length > 0)
                 {
                     try { Directory.CreateDirectory(settings.OutputDir); }
                     catch (Exception ex) { error = "Не удалось создать папку вывода:\n" + ex.Message; }
@@ -706,6 +731,28 @@ namespace RenderCrashSolver
             {
                 MessageBox.Show(this, error, "RenderCrashSolver", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
+            }
+
+            // Override: a new re-render needs confirmation; an unfinished one for the same scene/output just continues
+            bool overrideContinues = false;
+            if (settings.Override)
+            {
+                string key = OverrideKeyFor(settings);
+                if (settings.OverrideSince > 0 && settings.OverrideKey == key)
+                    overrideContinues = true;
+                else
+                {
+                    var answer = MessageBox.Show(this,
+                        "Override: все кадры будут отрендерены заново.\n\n" +
+                        "Уже существующие файлы кадров в папке вывода будут перезаписаны по мере рендера. " +
+                        "Если рендер прервётся или вы его остановите, при следующем старте он продолжится с места остановки, " +
+                        "а ещё не перезаписанные старые кадры останутся на месте.\n\nНачать?",
+                        AppTitle, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                    if (answer != DialogResult.Yes) return;
+                    settings.OverrideSince = ToUnixSeconds(DateTime.UtcNow);
+                    settings.OverrideKey = key;
+                    UpdateOverrideText();
+                }
             }
             settings.Save();
 
@@ -726,10 +773,15 @@ namespace RenderCrashSolver
             }
             if (txtLog.TextLength > 0) AddUi("");
             AddUi("Старт: " + Path.GetFileName(settings.BlendFile));
-            if (settings.OverrideOutput)
-                AddUi(string.Format("Путь вывода переопределён: папка = {0}, имя = {1}",
+            if (settings.CustomOutput)
+                AddUi(string.Format("Другая папка вывода: папка = {0}, имя = {1}",
                     settings.OutputDir.Length > 0 ? settings.OutputDir : "(из сцены)",
                     settings.OutputPrefix.Length > 0 ? settings.OutputPrefix : "(из сцены)"));
+            if (settings.Override)
+                AddUi(string.Format(overrideContinues
+                        ? "Override: продолжаю перерендер, начатый {0:dd.MM HH:mm}. Кадры, сохранённые раньше, перезаписываются."
+                        : "Override: перерендер всех кадров. Кадры, сохранённые раньше {0:dd.MM HH:mm}, перезаписываются.",
+                    FromUnixSeconds(settings.OverrideSince)));
             SetRunningUi(true);
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED); // keep PC awake during the render
             Launch();
@@ -764,8 +816,9 @@ namespace RenderCrashSolver
             // everything after "--" is ignored by Blender and read by resume_render.py
             var args = new StringBuilder();
             args.AppendFormat("-b \"{0}\" --python-exit-code {1} -P \"{2}\" --", settings.BlendFile, ScriptErrorExitCode, ScriptPath);
-            if (settings.OverrideOutput && settings.OutputDir.Length > 0) args.AppendFormat(" --output-dir \"{0}\"", settings.OutputDir);
-            if (settings.OverrideOutput && settings.OutputPrefix.Length > 0) args.AppendFormat(" --prefix \"{0}\"", settings.OutputPrefix);
+            if (settings.CustomOutput && settings.OutputDir.Length > 0) args.AppendFormat(" --output-dir \"{0}\"", settings.OutputDir);
+            if (settings.CustomOutput && settings.OutputPrefix.Length > 0) args.AppendFormat(" --prefix \"{0}\"", settings.OutputPrefix);
+            if (settings.Override && settings.OverrideSince > 0) args.AppendFormat(" --override-since {0}", settings.OverrideSince);
 
             var psi = new ProcessStartInfo(settings.BlenderExe, args.ToString())
             {
@@ -874,6 +927,15 @@ namespace RenderCrashSolver
             UpdateLabels();
             sceneInfoDueAt = DateTime.Now; // refresh "done N of M" for the scene path
 
+            if (final == RunState.Done && settings.Override)
+            {
+                // re-render complete: untick (the handler clears OverrideSince) so the next Start resumes normally
+                chkOverride.Checked = false;
+                settings.Override = false;
+                settings.Save();
+                AddUi("Override завершён: все кадры отрендерены заново, галочка снята.");
+            }
+
             if (final == RunState.Done)
             {
                 SystemSounds.Asterisk.Play();
@@ -889,6 +951,35 @@ namespace RenderCrashSolver
                 NotifyTelegram("✅ Рендер готов", true);
             else if (final == RunState.Failed && settings.TgOnFail)
                 NotifyTelegram("❌ Рендер остановлен: " + message, true);
+        }
+
+        // ─── Override (re-render all frames) ─────────────────────
+
+        // a pending re-render belongs to one scene + output; another scene/output starts a new one
+        static string OverrideKeyFor(Settings s)
+        {
+            string output = s.CustomOutput ? s.OutputDir + "|" + s.OutputPrefix : "";
+            return (s.BlendFile + "|" + output).ToLowerInvariant();
+        }
+
+        static readonly DateTime UnixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        static long ToUnixSeconds(DateTime utc)
+        {
+            return (long)(utc - UnixEpoch).TotalSeconds;
+        }
+
+        static DateTime FromUnixSeconds(long seconds)
+        {
+            return UnixEpoch.AddSeconds(seconds).ToLocalTime();
+        }
+
+        void UpdateOverrideText()
+        {
+            chkOverride.Text = chkOverride.Checked && settings.OverrideSince > 0
+                ? string.Format("Override — перерендерить все кадры заново (начат {0:dd.MM HH:mm}, продолжится с места остановки)",
+                    FromUnixSeconds(settings.OverrideSince))
+                : "Override — перерендерить все кадры заново (старые кадры перезаписываются)";
         }
 
         // ─── Telegram ────────────────────────────────────────────
