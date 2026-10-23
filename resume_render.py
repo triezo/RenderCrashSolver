@@ -148,6 +148,23 @@ def find_rendered_frames(output_dir, pattern, ext, fix_broken=True):
     return rendered
 
 
+def describe_existing(output_dir, pattern, frames):
+    """Log which files were counted as finished frames, so a wrong folder / stale renders are visible."""
+    if not frames:
+        return
+    names = {}
+    for fname in os.listdir(output_dir):
+        match = pattern.match(fname)
+        if match and int(match.group(1)) in frames:
+            names[int(match.group(1))] = fname
+    if not names:
+        return
+    newest = max(os.path.getmtime(os.path.join(output_dir, n)) for n in names.values())
+    log(f"Existing frames counted as done: {len(names)} files in {output_dir} "
+        f"({names[min(names)]} ... {names[max(names)]}), newest saved "
+        f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(newest))}")
+
+
 _frame_t0 = [0.0]
 
 
@@ -200,6 +217,7 @@ def main():
     rendered = find_rendered_frames(output_dir, pattern, ext) & full_range
     missing = sorted(full_range - rendered)
     log(f"STATUS total={len(full_range)} done={len(rendered)} missing={len(missing)}")
+    describe_existing(output_dir, pattern, rendered)
 
     if not missing:
         log("ALL_FRAMES_DONE - all frames already rendered.")

@@ -164,7 +164,7 @@ namespace RenderCrashSolver
 
     class MainForm : Form
     {
-        const string AppTitle = "RenderCrashSolver 0.2";
+        const string AppTitle = "RenderCrashSolver 0.3";
 #if TELEGRAM
         static readonly bool TelegramFeature = true;
 #else
@@ -690,7 +690,7 @@ namespace RenderCrashSolver
                         "\n\nЕсли программа запущена прямо из zip-архива — распакуйте архив целиком в обычную папку и запустите оттуда.";
             else if (settings.OverrideOutput && settings.OutputDir.Length > 0 && !Path.IsPathRooted(settings.OutputDir))
                 error = "Папка вывода должна быть полным путём, например E:\\Render\\shot01";
-            else if (settings.OverrideOutput && settings.OutputPrefix.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || settings.OutputPrefix.Contains("\""))
+            else if (settings.OverrideOutput && (settings.OutputPrefix.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || settings.OutputPrefix.Contains("\"")))
                 error = "Имя файла содержит недопустимые символы: " + settings.OutputPrefix;
             else
             {
@@ -1033,6 +1033,7 @@ namespace RenderCrashSolver
             if (msg.StartsWith("OUTPUT_PATH "))
             {
                 pendingSequencePath = msg.Substring(12).Trim();
+                uiLines.Enqueue(Stamp("Путь вывода: " + pendingSequencePath + (renderExt != null ? "####." + renderExt : "")));
                 return;
             }
             if (msg.StartsWith("OUTPUT_DIR "))
