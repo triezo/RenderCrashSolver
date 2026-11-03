@@ -15,7 +15,7 @@ mkdir "%OUT%"
 "%CSC%" /nologo /codepage:65001 /target:winexe /optimize+ ^
     /out:"%OUT%\RenderCrashSolver.exe" ^
     /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll ^
-    "%ROOT%RenderCrashSolver.cs" "%ROOT%PreviewPanel.cs" "%ROOT%Telegram.cs"
+    "%ROOT%RenderCrashSolver.cs" "%ROOT%PreviewPanel.cs" "%ROOT%Telegram.cs" "%ROOT%Theme.cs"
 if errorlevel 1 (
     echo BUILD FAILED
     pause

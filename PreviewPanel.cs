@@ -14,12 +14,14 @@ namespace RenderCrashSolver
     class PreviewPanel : UserControl
     {
         PictureBox picture;
-        TrackBar slider;
+        Scrubber slider;
         Label lblInfo;
-        Button btnPrev, btnNext, btnPlay, btnLatest, btnRescan;
-        CheckBox chkFollow;
-        NumericUpDown numFps;
+        UiButton btnPrev, btnNext, btnPlay, btnLatest, btnRescan;
+        Toggle chkFollow;
+        IntField numFps;
         Timer playTimer, resizeTimer;
+        ToolTip tips;
+        string emptyText = "";   // drawn in the middle of the viewer while there is no image
 
         // current sequence: <dir>\<prefix>####<suffix>.<ext>
         string seqDir, seqExt;
@@ -32,6 +34,11 @@ namespace RenderCrashSolver
         public PreviewPanel()
         {
             Dock = DockStyle.Fill;
+            AutoScaleMode = AutoScaleMode.None;
+            BackColor = Theme.Surface;
+            ForeColor = Theme.Text;
+            Font = Theme.Base;
+            tips = Theme.MakeToolTip();
 
             // timers first: control events below may fire while the layout is being built
             playTimer = new Timer { Interval = 1000 / 24 };
@@ -47,9 +54,8 @@ namespace RenderCrashSolver
                 if (!playTimer.Enabled && shownIndex >= 0) LoadImage(shownIndex);
             };
 
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1 };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Margin = Padding.Empty };
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             Controls.Add(layout);
@@ -57,11 +63,18 @@ namespace RenderCrashSolver
             picture = new PictureBox
             {
                 Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom,
-                BackColor = Color.FromArgb(32, 32, 32), Cursor = Cursors.Hand, Margin = new Padding(3),
+                BackColor = Theme.Viewer, Cursor = Cursors.Hand, Margin = Padding.Empty,
             };
             picture.DoubleClick += delegate { OpenShownFile(); };
+            picture.MouseDown += delegate { if (slider.Enabled) slider.Focus(); }; // arrow keys / space work after a click on the image
             picture.SizeChanged += delegate { resizeTimer.Stop(); resizeTimer.Start(); };
-            var menu = new ContextMenuStrip();
+            picture.Paint += (s, e) =>
+            {
+                if (picture.Image != null || emptyText.Length == 0) return;
+                TextRenderer.DrawText(e.Graphics, emptyText, Theme.Base, picture.ClientRectangle, Theme.TextFaint,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.WordBreak);
+            };
+            var menu = Theme.Menu();
             menu.Items.Add("Открыть кадр", null, delegate { OpenShownFile(); });
             menu.Items.Add("Показать в папке", null, delegate
             {
@@ -69,10 +82,10 @@ namespace RenderCrashSolver
                 if (p != null) Process.Start("explorer.exe", "/select,\"" + p + "\"");
             });
             picture.ContextMenuStrip = menu;
-            new ToolTip().SetToolTip(picture, "Двойной клик — открыть кадр в полном размере");
+            tips.SetToolTip(picture, "Двойной клик — открыть кадр в полном размере\n← / → — по кадру, пробел — проиграть");
             layout.Controls.Add(picture, 0, 0);
 
-            slider = new TrackBar { Dock = DockStyle.Fill, Minimum = 0, Maximum = 0, TickStyle = TickStyle.None, Margin = new Padding(3, 3, 3, 0) };
+            slider = new Scrubber { Dock = DockStyle.Fill, Margin = Theme.P(0, 8, 0, 4) };
             slider.ValueChanged += delegate
             {
                 if (updatingSlider) return;
@@ -80,34 +93,53 @@ namespace RenderCrashSolver
                 // scrubbing back pauses following; returning to the end resumes it
                 chkFollow.Checked = slider.Value == frames.Count - 1;
             };
+            slider.KeyDown += (s, e) => { if (e.KeyCode == Keys.Space) { TogglePlay(); e.Handled = true; } };
             layout.Controls.Add(slider, 0, 1);
 
-            lblInfo = new Label { AutoSize = false, Dock = DockStyle.Fill, AutoEllipsis = true, Height = 20, Margin = new Padding(3, 0, 3, 3), Text = "Нет кадров" };
-            layout.Controls.Add(lblInfo, 0, 2);
+            // transport buttons | frame info | follow, fps, rescan
+            var bar = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 5, RowCount = 1, Margin = Padding.Empty };
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            var transport = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Anchor = AnchorStyles.Left, Margin = Padding.Empty };
+            btnPrev = IconButton(Glyph.Prev, "Предыдущий кадр (←)", delegate { Step(-1); });
+            btnPlay = IconButton(Glyph.Play, "Проиграть подряд (пробел)", delegate { TogglePlay(); });
+            btnNext = IconButton(Glyph.Next, "Следующий кадр (→)", delegate { Step(1); });
+            btnLatest = IconButton(Glyph.Latest, "Последний кадр (End)", delegate { chkFollow.Checked = true; ShowIndex(frames.Count - 1); });
+            transport.Controls.AddRange(new Control[] { btnPrev, btnPlay, btnNext, btnLatest });
+            bar.Controls.Add(transport, 0, 0);
 
-            var bar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, Margin = new Padding(0) };
-            btnPrev = SmallButton("◀", delegate { Step(-1); });
-            btnNext = SmallButton("▶", delegate { Step(1); });
-            btnPlay = SmallButton("Играть", delegate { TogglePlay(); });
-            btnLatest = SmallButton("Последний", delegate { chkFollow.Checked = true; ShowIndex(frames.Count - 1); });
-            btnRescan = SmallButton("↻", delegate { Rescan(); });
-            new ToolTip().SetToolTip(btnRescan, "Перечитать папку с кадрами");
-            chkFollow = new CheckBox { Text = "Показывать новые кадры", Checked = true, AutoSize = true, Margin = new Padding(8, 6, 3, 3) };
-            var lblFps = new Label { Text = "FPS", AutoSize = true, Margin = new Padding(8, 6, 0, 3) };
-            numFps = new NumericUpDown { Minimum = 1, Maximum = 60, Value = 24, Width = 48, Margin = new Padding(3, 3, 3, 3) };
-            numFps.ValueChanged += delegate { playTimer.Interval = 1000 / (int)numFps.Value; };
-            bar.Controls.AddRange(new Control[] { btnPrev, btnPlay, btnNext, btnLatest, btnRescan, chkFollow, lblFps, numFps });
-            layout.Controls.Add(bar, 0, 3);
+            lblInfo = new Label
+            {
+                AutoSize = false, AutoEllipsis = true, UseMnemonic = false, Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                Height = Font.Height + Theme.S(4), ForeColor = Theme.TextDim, Margin = Theme.P(10, 0, 10, 0), TextAlign = ContentAlignment.MiddleLeft,
+            };
+            bar.Controls.Add(lblInfo, 1, 0);
+
+            chkFollow = new Toggle("Показывать новые", null) { Checked = true, Anchor = AnchorStyles.Left, Margin = Theme.P(0, 0, 14, 0) };
+            tips.SetToolTip(chkFollow, "Сразу показывать каждый новый готовый кадр");
+            bar.Controls.Add(chkFollow, 2, 0);
+            numFps = new IntField(1, 60, 24, "fps") { Width = Theme.S(76), Anchor = AnchorStyles.Left, Margin = Theme.P(0, 0, 6, 0) };
+            numFps.Box.TextChanged += delegate { playTimer.Interval = Math.Max(1, 1000 / numFps.Value); };
+            tips.SetToolTip(numFps.Box, "Скорость проигрывания");
+            bar.Controls.Add(numFps, 3, 0);
+            btnRescan = IconButton(Glyph.Refresh, "Перечитать папку с кадрами", delegate { Rescan(); });
+            btnRescan.Margin = Padding.Empty;
+            bar.Controls.Add(btnRescan, 4, 0);
+            layout.Controls.Add(bar, 0, 2);
+
+            // no sequence yet: disabled transport and the "path unknown" hint until SetSequence
+            SyncSlider();
+            UpdateInfo();
         }
 
-        Button SmallButton(string text, EventHandler click)
+        UiButton IconButton(Glyph glyph, string tip, EventHandler click)
         {
-            var b = new Button
-            {
-                Text = text, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                MinimumSize = new Size(32, 0), Padding = new Padding(6, 1, 6, 1), Margin = new Padding(0, 0, 4, 0),
-            };
+            var b = new UiButton("", glyph, ButtonKind.Ghost) { Margin = Theme.P(0, 0, 2, 0) };
             b.Click += click;
+            tips.SetToolTip(b, tip);
             return b;
         }
 
@@ -230,13 +262,13 @@ namespace RenderCrashSolver
             if (playTimer.Enabled)
             {
                 playTimer.Stop();
-                btnPlay.Text = "Играть";
+                btnPlay.Glyph = Glyph.Play;
             }
             else if (frames.Count > 0)
             {
                 chkFollow.Checked = false;
                 playTimer.Start();
-                btnPlay.Text = "Пауза";
+                btnPlay.Glyph = Glyph.Pause;
             }
         }
 
@@ -302,16 +334,25 @@ namespace RenderCrashSolver
         {
             if (frames.Count == 0)
             {
-                lblInfo.Text = seqPattern == null ? "Нет кадров (путь вывода ещё не известен)" : "Нет готовых кадров в " + seqDir;
+                lblInfo.Text = "";
+                SetEmptyText(seqPattern == null ? "Кадров нет: путь вывода ещё не известен" : "Пока нет готовых кадров в\n" + seqDir);
                 return;
             }
+            SetEmptyText(loadError ?? "");
             if (shownIndex < 0) { lblInfo.Text = frames.Count + " кадров"; return; }
             string path = paths[frames[shownIndex]];
             string when = "";
             try { when = File.GetLastWriteTime(path).ToString("dd.MM HH:mm:ss"); } catch { }
-            lblInfo.Text = string.Format("Кадр {0}   ({1} из {2} на диске)   ·   {3}   ·   {4}{5}",
+            lblInfo.Text = string.Format("Кадр {0}   ·   {1} из {2} на диске   ·   {3}   ·   {4}{5}",
                 frames[shownIndex], shownIndex + 1, frames.Count, Path.GetFileName(path), when,
                 loadError != null ? "   ·   " + loadError : "");
+        }
+
+        void SetEmptyText(string text)
+        {
+            if (emptyText == text) return;
+            emptyText = text;
+            picture.Invalidate();
         }
 
         void OpenShownFile()

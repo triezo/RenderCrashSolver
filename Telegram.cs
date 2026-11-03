@@ -231,15 +231,16 @@ namespace RenderCrashSolver
             this.settings = settings;
             Text = "Уведомления в Telegram";
             Font = new Font("Segoe UI", 9F);
-            AutoScaleDimensions = new SizeF(96F, 96F);
-            AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScaleMode = AutoScaleMode.None; // sizes go through Theme.S, like the main window
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(640, 540);
+            ClientSize = new Size(Theme.S(640), Theme.S(540));
 
-            var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, Padding = new Padding(12) };
+            // every row sizes to its content except the chat list, which takes what is left
+            var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, Padding = Theme.P(12, 12, 12, 12) };
+            for (int i = 0; i < 8; i++) t.RowStyles.Add(new RowStyle(i == 5 ? SizeType.Percent : SizeType.AutoSize, 100));
             t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -250,7 +251,7 @@ namespace RenderCrashSolver
 
             var help = new Label
             {
-                AutoSize = true, MaximumSize = new Size(600, 0), ForeColor = SystemColors.GrayText, Margin = new Padding(3, 6, 3, 10),
+                AutoSize = true, MaximumSize = new Size(Theme.S(600), 0), ForeColor = SystemColors.GrayText, Margin = new Padding(3, 6, 3, 10),
                 Text = "1. В Telegram откройте @BotFather → /newbot → скопируйте токен сюда.\n" +
                        "2. Каждый, кто должен получать уведомления, пишет вашему боту /start.\n" +
                        "    Или добавьте бота в общий чат и напишите там любое сообщение.\n" +
@@ -274,19 +275,19 @@ namespace RenderCrashSolver
             t.Controls.Add(btnFind);
 
             lblBot = new Label { AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(3, 2, 3, 2), Text = "chat ID через запятую — или отметьте ниже" };
-            t.Controls.Add(new Label());
+            t.Controls.Add(new Label { AutoSize = true });
             t.Controls.Add(lblBot);
             t.SetColumnSpan(lblBot, 2);
 
-            lstChats = new CheckedListBox { Dock = DockStyle.Fill, Height = 120, CheckOnClick = true, IntegralHeight = false };
+            lstChats = new CheckedListBox { Dock = DockStyle.Fill, CheckOnClick = true, IntegralHeight = false };
             lstChats.ItemCheck += OnChatChecked;
             AddFull(t, lstChats);
 
             var grpWhen = new GroupBox { Text = "Когда отправлять", Dock = DockStyle.Fill, AutoSize = true, Padding = new Padding(8), Margin = new Padding(3, 10, 3, 3) };
             var flowWhen = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.TopDown };
-            chkDone = new CheckBox { Text = "✅ Рендер готов", AutoSize = true, Checked = settings.TgOnDone };
-            chkFail = new CheckBox { Text = "❌ Рендер остановился с ошибкой (лимит попыток, ошибка скрипта)", AutoSize = true, Checked = settings.TgOnFail };
-            chkCrash = new CheckBox { Text = "⚠ Каждый краш Blender (перед автоматическим перезапуском)", AutoSize = true, Checked = settings.TgOnCrash };
+            chkDone = new CheckBox { Text = "Рендер готов", AutoSize = true, Checked = settings.TgOnDone };
+            chkFail = new CheckBox { Text = "Рендер остановился с ошибкой (лимит попыток, ошибка скрипта)", AutoSize = true, Checked = settings.TgOnFail };
+            chkCrash = new CheckBox { Text = "Каждый краш Blender (перед автоматическим перезапуском)", AutoSize = true, Checked = settings.TgOnCrash };
             chkPhoto = new CheckBox { Text = "Прикреплять последний отрендеренный кадр", AutoSize = true, Checked = settings.TgPhoto };
             flowWhen.Controls.AddRange(new Control[] { chkDone, chkFail, chkCrash, chkPhoto });
             grpWhen.Controls.Add(flowWhen);
@@ -302,6 +303,13 @@ namespace RenderCrashSolver
             AddFull(t, bottom);
             AcceptButton = btnOk;
             CancelButton = btnCancel;
+            Theme.ApplyDialog(this);
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            Theme.DarkTitleBar(Handle);
         }
 
         static void AddFull(TableLayoutPanel t, Control c)

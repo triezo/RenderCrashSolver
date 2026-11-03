@@ -194,24 +194,32 @@ namespace RenderCrashSolver
 
         Settings settings;
 
-        TextBox txtBlender, txtBlend, txtOutputDir, txtOutputPrefix, txtLogDir, txtLog;
-        CheckBox chkCustomOutput, chkOverride;
-        Label lblScenePath, lblEffectivePath;
-        Button btnSceneRefresh, btnOutputBrowse;
+        // the TextBoxes inside the Fields: the session code reads and writes them directly
+        TextBox txtBlender, txtBlend, txtOutputDir, txtOutputPrefix, txtLogDir;
+        LogView txtLog;
+        Toggle chkCustomOutput, chkOverride;
+        Label lblScenePath, lblSceneMeta, lblEffectivePath, lblStatus, lblSubtitle, lblTelegram;
+        UiButton btnSceneRefresh;
+        readonly List<Control> customOutputRows = new List<Control>(); // shown only with "Другая папка вывода"
 
         // scene output settings read from the .blend via "resume_render.py -- --info"
         string sceneFilepath, sceneExt;
+        int sceneTotal, sceneDone;   // frame range size / frames already on disk, shown before the first Start
         Process infoProc;
         int infoRequestId;
         DateTime sceneInfoDueAt = DateTime.MinValue;
-        NumericUpDown numRetries, numPause, numHang;
-        Button btnStart, btnStop, btnLogs, btnOutput, btnTelegram;
-        Label lblStatus, lblFrames, lblAttempts, lblTimes;
-        ProgressBar progress;
+        IntField numRetries, numPause, numHang;
+        UiButton btnStart, btnStop, btnLogs, btnOutput, btnTelegram;
+        Badge badge;
+        ProgressStrip progress;
+        StatTile tileFrames, tileEta, tileAvg, tileElapsed, tileAttempts;
+        ToolTip tips;
         NotifyIcon tray;
         Timer timer;
         List<Control> settingsControls = new List<Control>();
         PreviewPanel preview;
+        TaskbarState taskbarState = TaskbarState.None;
+        int taskbarValue = -1, taskbarTotal = -1;
 
         // session state, UI thread only
         RunState state = RunState.Idle;
@@ -223,7 +231,7 @@ namespace RenderCrashSolver
 
         // shared with the output reader threads, guarded by sync
         readonly object sync = new object();
-        readonly Queue<string> uiLines = new Queue<string>();
+        readonly Queue<LogLine> uiLines = new Queue<LogLine>();
         readonly HashSet<string> seenWarnings = new HashSet<string>();
         readonly List<double> durations = new List<double>();
         StreamWriter logWriter;
@@ -245,19 +253,33 @@ namespace RenderCrashSolver
             sceneInfoDueAt = DateTime.Now; // read the scene output path on startup
         }
 
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            Theme.DarkTitleBar(Handle);
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == Keys.F5 && btnStart.Enabled) { StartSession(); return true; }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
         // ─── UI construction ─────────────────────────────────────
 
         void BuildUi()
         {
             SuspendLayout();
-            AutoScaleDimensions = new SizeF(96F, 96F);
-            AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScaleMode = AutoScaleMode.None; // pixel sizes go through Theme.S, fonts follow the system DPI
             Text = AppTitle;
-            Font = new Font("Segoe UI", 9F);
-            ClientSize = new Size(1500, 820);
-            MinimumSize = new Size(900, 540);
+            Font = Theme.Base;
+            BackColor = Theme.Bg;
+            ForeColor = Theme.Text;
+            ClientSize = new Size(Theme.S(1440), Theme.S(860));
+            MinimumSize = new Size(Theme.S(1040), Theme.S(640));
             StartPosition = FormStartPosition.CenterScreen;
-            Icon = SystemIcons.Application;
+            Icon = Theme.AppIcon(Theme.S(32));
+            tips = Theme.MakeToolTip();
             Load += delegate
             {
                 // laptops / 125-150% scaling: the default size may not fit the screen
@@ -265,78 +287,189 @@ namespace RenderCrashSolver
                 if (Width > area.Width || Height > area.Height) WindowState = FormWindowState.Maximized;
             };
 
-            // left: settings / progress / log, right: frame preview
-            var split = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1 };
-            Controls.Add(split);
-            Shown += delegate
-            {
-                float scale;
-                using (Graphics g = CreateGraphics()) scale = g.DpiX / 96F;
-                try
-                {
-                    split.Panel1MinSize = (int)(840 * scale);
-                    split.Panel2MinSize = (int)(200 * scale);
-                    split.SplitterDistance = (int)(860 * scale);
-                }
-                catch { } // window smaller than the minimums: keep defaults
-            };
-
-            var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(10) };
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            // header with status and numbers; below it settings on the left, frames over the log on the right
+            var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = Theme.P(12, 12, 12, 12), Margin = Padding.Empty };
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            split.Panel1.Controls.Add(root);
+            Controls.Add(root);
+            root.Controls.Add(BuildHeader(), 0, 0);
 
-            var grpPreview = new GroupBox { Text = "Просмотр кадров", Dock = DockStyle.Fill, Padding = new Padding(8) };
-            preview = new PreviewPanel();
-            grpPreview.Controls.Add(preview);
-            var previewHost = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 10, 10, 10) };
-            previewHost.Controls.Add(grpPreview);
-            split.Panel2.Controls.Add(previewHost);
+            var body = new Split { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1, Margin = Theme.P(0, 12, 0, 0) };
+            var right = new Split { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal };
+            body.Panel1.Controls.Add(BuildSettings());
+            right.Panel1.Controls.Add(BuildPreview());
+            right.Panel2.Controls.Add(BuildLog());
+            body.Panel2.Controls.Add(right);
+            root.Controls.Add(body, 0, 1);
+            // the settings column keeps its width (default or dragged by the user), but on a narrow window
+            // it gives way so the preview toolbar still fits, and comes back when the window grows
+            int settingsWidth = 0;
+            bool fitting = false;
+            Action fitSettings = delegate
+            {
+                if (settingsWidth == 0) return;
+                int target = Math.Max(body.Panel1MinSize, Math.Min(settingsWidth, body.Width - body.SplitterWidth - Theme.S(600)));
+                if (body.SplitterDistance == target) return;
+                fitting = true;
+                try { body.SplitterDistance = target; } catch { }
+                fitting = false;
+            };
+            body.SizeChanged += delegate { fitSettings(); };
+            body.SplitterMoved += delegate { if (!fitting && settingsWidth > 0) settingsWidth = body.SplitterDistance; };
+            Shown += delegate
+            {
+                try
+                {
+                    body.Panel1MinSize = Theme.S(460);
+                    body.Panel2MinSize = Theme.S(420);
+                    right.Panel1MinSize = Theme.S(220);
+                    right.Panel2MinSize = Theme.S(120);
+                    right.SplitterDistance = right.Height * 3 / 5;
+                }
+                catch { } // window smaller than the minimums: keep defaults
+                settingsWidth = Theme.S(540);
+                fitSettings();
+                ActiveControl = btnStart;
+            };
 
-            // settings
-            var grpSettings = new GroupBox { Text = "Настройки", Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8) };
-            var tbl = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 3 };
-            tbl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            tbl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            tbl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            grpSettings.Controls.Add(tbl);
+            tray = new NotifyIcon { Icon = Theme.AppIcon(Theme.S(16)), Text = "RenderCrashSolver", Visible = true };
+            tray.Click += delegate { Show(); if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal; Activate(); };
 
-            txtBlender = AddPathRow(tbl, 0, "Blender.exe", settings.BlenderExe, delegate
+            timer = new Timer { Interval = 500 };
+            timer.Tick += delegate { OnTick(); };
+            timer.Start();
+
+            ResumeLayout(true);
+        }
+
+        Control BuildHeader()
+        {
+            var card = new Card { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = Theme.P(18, 14, 18, 16), Margin = Padding.Empty };
+            var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 3, Margin = Padding.Empty };
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            card.Controls.Add(t);
+
+            badge = new Badge { Anchor = AnchorStyles.Left, Margin = Theme.P(0, 0, 10, 0) };
+            lblStatus = new Label
+            {
+                AutoSize = false, AutoEllipsis = true, UseMnemonic = false, Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                Font = Theme.Title, Height = Theme.Title.Height + Theme.S(4), TextAlign = ContentAlignment.MiddleLeft, Margin = Padding.Empty,
+            };
+            lblSubtitle = new Label
+            {
+                AutoSize = false, AutoEllipsis = true, UseMnemonic = false, Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                ForeColor = Theme.TextDim, Height = Font.Height + Theme.S(4), Margin = Theme.P(0, 2, 0, 0),
+            };
+            t.Controls.Add(badge, 0, 0);
+            t.Controls.Add(lblStatus, 1, 0);
+            t.Controls.Add(lblSubtitle, 0, 1);
+            t.SetColumnSpan(lblSubtitle, 2);
+
+            btnStop = new UiButton("Стоп", Glyph.Stop, ButtonKind.Danger) { ButtonHeight = Theme.S(38), MinWidth = Theme.S(104), Margin = Theme.P(0, 0, 8, 0) };
+            btnStop.Click += delegate { StopSession(); };
+            btnStart = new UiButton("Старт", Glyph.Play, ButtonKind.Primary) { ButtonHeight = Theme.S(38), MinWidth = Theme.S(132), Font = Theme.Strong, Margin = Padding.Empty };
+            btnStart.Click += delegate { StartSession(); };
+            tips.SetToolTip(btnStart, "Запустить рендер (F5)");
+            var buttons = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Anchor = AnchorStyles.Right, Margin = Theme.P(16, 0, 0, 0) };
+            buttons.Controls.Add(btnStop);
+            buttons.Controls.Add(btnStart);
+            t.Controls.Add(buttons, 2, 0);
+            t.SetRowSpan(buttons, 2);
+
+            progress = new ProgressStrip { Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = Theme.P(0, 14, 0, 14) };
+            t.Controls.Add(progress, 0, 2);
+            t.SetColumnSpan(progress, 3);
+
+            var tiles = new TableLayoutPanel { Anchor = AnchorStyles.Left | AnchorStyles.Right, Height = StatTile.PreferredHeight, ColumnCount = 5, RowCount = 1, Margin = Padding.Empty };
+            for (int i = 0; i < 5; i++) tiles.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20));
+            tiles.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tileFrames = AddTile(tiles, 0, "Кадры", null);
+            tileEta = AddTile(tiles, 1, "Осталось", "Примерно: среднее время кадра × оставшиеся кадры");
+            tileAvg = AddTile(tiles, 2, "Среднее время кадра", "По последним 20 кадрам");
+            tileElapsed = AddTile(tiles, 3, "Прошло", null);
+            tileAttempts = AddTile(tiles, 4, "Попытка", "Запуски Blender в этой сессии");
+            t.Controls.Add(tiles, 0, 3);
+            t.SetColumnSpan(tiles, 3);
+            return card;
+        }
+
+        StatTile AddTile(TableLayoutPanel tiles, int col, string caption, string tip)
+        {
+            var tile = new StatTile(caption) { Dock = DockStyle.Fill, Margin = col < 4 ? Theme.P(0, 0, 10, 0) : Padding.Empty };
+            if (tip != null) tips.SetToolTip(tile, tip);
+            tiles.Controls.Add(tile, col, 0);
+            return tile;
+        }
+
+        Control BuildSettings()
+        {
+            var card = new Card { Dock = DockStyle.Fill, AutoScroll = true, Padding = Theme.P(18, 16, 18, 16) };
+            card.HandleCreated += delegate { Theme.DarkScrollbars(card); };
+            var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 3, Margin = Padding.Empty };
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            card.Controls.Add(t);
+
+            AddSection(t, "Сцена", true);
+            txtBlender = AddPathRow(t, "Blender", settings.BlenderExe, "путь к blender.exe", delegate
             {
                 BrowseFile(txtBlender, "Blender|blender.exe|Программы (*.exe)|*.exe");
-            });
-            txtBlend = AddPathRow(tbl, 1, "Сцена .blend", settings.BlendFile, delegate
+            }, null);
+            txtBlend = AddPathRow(t, "Сцена", settings.BlendFile, "файл сцены .blend", delegate
             {
                 BrowseFile(txtBlend, "Blender scene (*.blend)|*.blend");
-            });
-            // output: the scene's own path is primary, a different output folder is optional
-            tbl.Controls.Add(new Label { Text = "Вывод (сцена)", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 6, 8, 3) }, 0, 2);
-            lblScenePath = new Label { AutoSize = false, Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft, Height = txtBlend.Height + 4, Margin = new Padding(3, 2, 3, 2), Text = "—" };
-            tbl.Controls.Add(lblScenePath, 1, 2);
-            btnSceneRefresh = new Button { Text = "↻", Width = 36, Height = txtBlend.Height + 2, Margin = new Padding(3, 2, 3, 2) };
-            btnSceneRefresh.Click += delegate { RefreshSceneInfo(); };
-            new ToolTip().SetToolTip(btnSceneRefresh, "Перечитать путь вывода из .blend");
-            tbl.Controls.Add(btnSceneRefresh, 2, 2);
-            settingsControls.Add(btnSceneRefresh);
+            }, null);
 
-            chkCustomOutput = new CheckBox { Text = "Другая папка вывода (вместо пути из сцены; .blend не изменяется)", AutoSize = true, Checked = settings.CustomOutput, Margin = new Padding(3, 4, 3, 2) };
-            tbl.Controls.Add(chkCustomOutput, 0, 3);
-            tbl.SetColumnSpan(chkCustomOutput, 3);
+            // output: the scene's own path is primary, a different output folder is optional
+            int row = NextRow(t);
+            t.Controls.Add(RowLabel("Вывод"), 0, row);
+            lblScenePath = new Label
+            {
+                AutoSize = false, AutoEllipsis = true, UseMnemonic = false, Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                Height = Font.Height + Theme.S(4), Margin = Theme.P(0, 7, 8, 0), Cursor = Cursors.Hand, Text = "—",
+            };
+            lblScenePath.Click += delegate { if (sceneFilepath != null) OpenFolder(Path.GetDirectoryName(sceneFilepath)); };
+            t.Controls.Add(lblScenePath, 1, row);
+            btnSceneRefresh = new UiButton("", Glyph.Refresh, ButtonKind.Ghost) { Anchor = AnchorStyles.Top, Margin = Theme.P(0, 3, 0, 3) };
+            btnSceneRefresh.Click += delegate { RefreshSceneInfo(); };
+            tips.SetToolTip(btnSceneRefresh, "Перечитать путь вывода из .blend");
+            t.Controls.Add(btnSceneRefresh, 2, row);
+            t.SetRowSpan(btnSceneRefresh, 2);
+            settingsControls.Add(btnSceneRefresh);
+            row = NextRow(t);
+            lblSceneMeta = new Label
+            {
+                AutoSize = false, AutoEllipsis = true, UseMnemonic = false, Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                Font = Theme.Small, ForeColor = Theme.TextDim, Height = Theme.Small.Height + Theme.S(4), Margin = Theme.P(0, 0, 8, 4),
+            };
+            t.Controls.Add(lblSceneMeta, 1, row);
+
+            row = NextRow(t);
+            chkCustomOutput = new Toggle("Другая папка вывода", "Своя папка или имя файла; сам .blend не меняется.")
+            {
+                Checked = settings.CustomOutput, Margin = Theme.P(0, 14, 0, 4),
+            };
+            t.Controls.Add(chkCustomOutput, 0, row);
+            t.SetColumnSpan(chkCustomOutput, 3);
             settingsControls.Add(chkCustomOutput);
 
-            txtOutputDir = AddPathRow(tbl, 4, "   Папка", settings.OutputDir, delegate
+            txtOutputDir = AddPathRow(t, "Папка", settings.OutputDir, "пусто — папка из сцены", delegate
             {
                 BrowseFolder(txtOutputDir);
-            });
-            SetCueBanner(txtOutputDir, "пусто — папка из сцены");
-            btnOutputBrowse = (Button)tbl.GetControlFromPosition(2, 4);
-            txtOutputPrefix = AddTextRow(tbl, 5, "   Имя файла", settings.OutputPrefix);
-            SetCueBanner(txtOutputPrefix, "пусто — имя из сцены; например shot_ → shot_0001.jpg");
-            lblEffectivePath = new Label { AutoSize = false, Dock = DockStyle.Fill, AutoEllipsis = true, Height = txtBlend.Height, Margin = new Padding(3, 0, 3, 4), ForeColor = SystemColors.GrayText };
-            tbl.Controls.Add(lblEffectivePath, 1, 6);
-            tbl.SetColumnSpan(lblEffectivePath, 2);
+            }, customOutputRows);
+            txtOutputPrefix = AddTextRow(t, "Имя файла", settings.OutputPrefix, "пусто — из сцены; shot_ → shot_0001.jpg", customOutputRows);
+            row = NextRow(t);
+            lblEffectivePath = new Label
+            {
+                AutoSize = false, AutoEllipsis = true, UseMnemonic = false, Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                Font = Theme.Small, ForeColor = Theme.TextDim, Height = Theme.Small.Height + Theme.S(4), Margin = Theme.P(0, 2, 0, 2),
+            };
+            t.Controls.Add(lblEffectivePath, 1, row);
+            t.SetColumnSpan(lblEffectivePath, 2);
+            customOutputRows.Add(lblEffectivePath);
 
             chkCustomOutput.CheckedChanged += delegate
             {
@@ -353,111 +486,198 @@ namespace RenderCrashSolver
             txtBlend.TextChanged += delegate { sceneInfoDueAt = DateTime.Now.AddMilliseconds(800); };
             txtBlender.TextChanged += delegate { sceneInfoDueAt = DateTime.Now.AddMilliseconds(800); };
 
-            chkOverride = new CheckBox { AutoSize = true, Checked = settings.Override, Margin = new Padding(3, 6, 3, 4) };
+            row = NextRow(t);
+            chkOverride = new Toggle("Override — перерендерить все кадры заново", "") { Checked = settings.Override, Margin = Theme.P(0, 12, 0, 0) };
             chkOverride.CheckedChanged += delegate
             {
                 // unticking cancels a re-render in progress: from then on existing frames count as done again
                 if (!chkOverride.Checked) { settings.OverrideSince = 0; settings.OverrideKey = ""; }
                 UpdateOverrideText();
             };
-            tbl.Controls.Add(chkOverride, 0, 7);
-            tbl.SetColumnSpan(chkOverride, 3);
+            t.Controls.Add(chkOverride, 0, row);
+            t.SetColumnSpan(chkOverride, 3);
             settingsControls.Add(chkOverride);
             UpdateOverrideText();
 
-            txtLogDir = AddPathRow(tbl, 8, "Папка логов", settings.LogDir, delegate
+            AddSection(t, "Перезапуск", false);
+            row = NextRow(t);
+            var nums = new TableLayoutPanel
+            {
+                Anchor = AnchorStyles.Left | AnchorStyles.Right, ColumnCount = 3, RowCount = 2, Margin = Padding.Empty,
+                Height = Theme.Small.Height + Theme.S(4) + Theme.S(28) + Theme.S(2),
+            };
+            for (int i = 0; i < 3; i++) nums.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.3F));
+            nums.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            nums.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            numRetries = AddNumber(nums, 0, "Макс. попыток", 1, 1000, settings.MaxRetries, "",
+                "Сколько раз запускать Blender, прежде чем остановиться с ошибкой");
+            numPause = AddNumber(nums, 1, "Пауза перед повтором", 0, 600, settings.RetryPauseSec, "с",
+                "Пауза между крашем и новым запуском Blender");
+            numHang = AddNumber(nums, 2, "Нет нового кадра", 0, 1440, settings.HangTimeoutMin, "мин",
+                "Если нового кадра нет дольше этого времени,\nBlender считается зависшим и перезапускается.\n0 — не следить");
+            t.Controls.Add(nums, 0, row);
+            t.SetColumnSpan(nums, 3);
+
+            AddSection(t, TelegramFeature ? "Логи и уведомления" : "Логи", false);
+            txtLogDir = AddPathRow(t, "Папка логов", settings.LogDir, null, delegate
             {
                 BrowseFolder(txtLogDir);
-            });
+            }, null);
 
-            var flow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = new Padding(0, 4, 0, 0) };
-            numRetries = AddNumber(flow, "Макс. попыток", 1, 1000, settings.MaxRetries);
-            numPause = AddNumber(flow, "Пауза перед перезапуском, с", 0, 600, settings.RetryPauseSec);
-            numHang = AddNumber(flow, "Перезапуск, если нет нового кадра, мин (0 = выкл.)", 0, 1440, settings.HangTimeoutMin);
-            tbl.Controls.Add(flow, 0, 9);
-            tbl.SetColumnSpan(flow, 3);
-            root.Controls.Add(grpSettings, 0, 0);
+            row = NextRow(t);
+            var lblTg = RowLabel("Telegram");
+            var tg = new TableLayoutPanel { Anchor = AnchorStyles.Left | AnchorStyles.Right, ColumnCount = 2, RowCount = 1, Height = Theme.S(34), Margin = Padding.Empty };
+            tg.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tg.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            lblTelegram = new Label
+            {
+                AutoSize = false, AutoEllipsis = true, Anchor = AnchorStyles.Left | AnchorStyles.Right, ForeColor = Theme.TextDim,
+                Height = Font.Height + Theme.S(4), Margin = Padding.Empty,
+            };
+            btnTelegram = new UiButton("Настроить…", Glyph.None, ButtonKind.Normal) { Anchor = AnchorStyles.Right, Margin = Padding.Empty };
+            btnTelegram.Click += delegate
+            {
+                using (var dlg = new TelegramForm(settings)) dlg.ShowDialog(this);
+                UpdateTelegramButton();
+            };
+            tg.Controls.Add(lblTelegram, 0, 0);
+            tg.Controls.Add(btnTelegram, 1, 0);
+            t.Controls.Add(lblTg, 0, row);
+            t.Controls.Add(tg, 1, row);
+            t.SetColumnSpan(tg, 2);
+            lblTg.Visible = tg.Visible = TelegramFeature;
+            return card;
+        }
 
-            // progress
-            var grpProgress = new GroupBox { Text = "Прогресс", Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8) };
-            var ptbl = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1 };
-            ptbl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            lblStatus = new Label { AutoSize = true, Font = new Font("Segoe UI", 13F, FontStyle.Bold), Margin = new Padding(3, 0, 3, 6) };
-            progress = new ProgressBar { Dock = DockStyle.Fill, Height = 24, Minimum = 0, Maximum = 1 };
-            lblFrames = new Label { AutoSize = true, Margin = new Padding(3, 8, 3, 2) };
-            lblAttempts = new Label { AutoSize = true, Margin = new Padding(3, 2, 3, 2) };
-            lblTimes = new Label { AutoSize = true, Margin = new Padding(3, 2, 3, 2) };
-            ptbl.Controls.Add(lblStatus);
-            ptbl.Controls.Add(progress);
-            ptbl.Controls.Add(lblFrames);
-            ptbl.Controls.Add(lblAttempts);
-            ptbl.Controls.Add(lblTimes);
-            grpProgress.Controls.Add(ptbl);
-            root.Controls.Add(grpProgress, 0, 1);
-
-            // buttons
-            var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, Margin = new Padding(0, 6, 0, 6) };
-            btnStart = MakeButton("▶  Старт", delegate { StartSession(); });
-            btnStart.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
-            btnStop = MakeButton("■  Стоп", delegate { StopSession(); });
-            btnLogs = MakeButton("Папка логов", delegate { OpenFolder(txtLogDir.Text); });
-            btnOutput = MakeButton("Папка рендера", delegate
+        Control BuildPreview()
+        {
+            var card = new Card { Dock = DockStyle.Fill, Padding = Theme.P(16, 12, 16, 14) };
+            TableLayoutPanel t = CardLayout(card);
+            btnOutput = new UiButton("Папка рендера", Glyph.Folder, ButtonKind.Ghost);
+            btnOutput.Click += delegate
             {
                 string dir;
                 lock (sync) dir = outputDir;
                 OpenFolder(dir);
-            });
-            btnTelegram = MakeButton("Telegram…", delegate
-            {
-                using (var dlg = new TelegramForm(settings)) dlg.ShowDialog(this);
-                UpdateTelegramButton();
-            });
-            btnTelegram.Visible = TelegramFeature;
-            buttons.Controls.AddRange(new Control[] { btnStart, btnStop, btnLogs, btnOutput, btnTelegram });
-            root.Controls.Add(buttons, 0, 2);
-
-            // short log
-            var grpLog = new GroupBox { Text = "Лог (события, ошибки, уникальные предупреждения; полный лог — в файле)", Dock = DockStyle.Fill, Padding = new Padding(8) };
-            txtLog = new TextBox
-            {
-                Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
-                WordWrap = true, Font = new Font("Consolas", 9F), BackColor = SystemColors.Window,
             };
-            grpLog.Controls.Add(txtLog);
-            root.Controls.Add(grpLog, 0, 3);
-
-            tray = new NotifyIcon { Icon = SystemIcons.Application, Text = "RenderCrashSolver", Visible = true };
-            tray.Click += delegate { Show(); if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal; Activate(); };
-
-            timer = new Timer { Interval = 500 };
-            timer.Tick += delegate { OnTick(); };
-            timer.Start();
-
-            ResumeLayout(true);
+            t.Controls.Add(CardHeader("Кадры", null, btnOutput), 0, 0);
+            preview = new PreviewPanel { Margin = Padding.Empty };
+            t.Controls.Add(preview, 0, 1);
+            return card;
         }
 
-        TextBox AddPathRow(TableLayoutPanel tbl, int row, string label, string value, EventHandler browse)
+        Control BuildLog()
         {
-            var lbl = new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 6, 8, 3) };
-            var txt = new TextBox { Text = value, Dock = DockStyle.Fill, Margin = new Padding(3, 3, 3, 3) };
-            var btn = new Button { Text = "…", Width = 36, Height = txt.Height + 2, Margin = new Padding(3, 2, 3, 2) };
+            var card = new Card { Dock = DockStyle.Fill, Padding = Theme.P(16, 12, 16, 16) };
+            TableLayoutPanel t = CardLayout(card);
+            btnLogs = new UiButton("Папка логов", Glyph.Folder, ButtonKind.Ghost);
+            btnLogs.Click += delegate { OpenFolder(txtLogDir.Text); };
+            t.Controls.Add(CardHeader("Журнал", "события, ошибки и уникальные предупреждения · полный лог — в файле", btnLogs), 0, 0);
+            var well = new Card { Dock = DockStyle.Fill, BackColor = Theme.Input, Radius = Theme.S(4), Padding = Theme.P(10, 8, 2, 8), Margin = Padding.Empty };
+            txtLog = new LogView { Dock = DockStyle.Fill };
+            well.Controls.Add(txtLog);
+            t.Controls.Add(well, 0, 1);
+            return card;
+        }
+
+        static TableLayoutPanel CardLayout(Card card)
+        {
+            var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = Padding.Empty };
+            t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            card.Controls.Add(t);
+            return t;
+        }
+
+        static Control CardHeader(string title, string hint, Control tool)
+        {
+            var h = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 3, RowCount = 1, Margin = Theme.P(0, 0, 0, 8) };
+            h.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            h.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            h.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            h.Controls.Add(new Label
+            {
+                Text = title.ToUpperInvariant(), AutoSize = true, Font = Theme.Caption, ForeColor = Theme.TextFaint,
+                Anchor = AnchorStyles.Left, Margin = Theme.P(0, 0, 12, 0),
+            }, 0, 0);
+            if (hint != null)
+                h.Controls.Add(new Label
+                {
+                    Text = hint, AutoSize = false, AutoEllipsis = true, Anchor = AnchorStyles.Left | AnchorStyles.Right, Font = Theme.Small,
+                    ForeColor = Theme.TextFaint, Height = Theme.Small.Height + Theme.S(2), Margin = Padding.Empty,
+                }, 1, 0);
+            tool.Anchor = AnchorStyles.Right;
+            tool.Margin = Padding.Empty;
+            h.Controls.Add(tool, 2, 0);
+            return h;
+        }
+
+        static int NextRow(TableLayoutPanel t)
+        {
+            t.RowCount++;
+            return t.RowCount - 1;
+        }
+
+        static void AddSection(TableLayoutPanel t, string title, bool first)
+        {
+            var lbl = new Label
+            {
+                Text = title.ToUpperInvariant(), AutoSize = true, Font = Theme.Caption, ForeColor = Theme.TextFaint,
+                Margin = Theme.P(0, first ? 0 : 22, 0, 6),
+            };
+            t.Controls.Add(lbl, 0, NextRow(t));
+            t.SetColumnSpan(lbl, 3);
+        }
+
+        static Label RowLabel(string text)
+        {
+            return new Label { Text = text, AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Theme.TextDim, Margin = Theme.P(0, 0, 14, 0) };
+        }
+
+        TextBox AddPathRow(TableLayoutPanel t, string label, string value, string hint, EventHandler browse, List<Control> group)
+        {
+            int row = NextRow(t);
+            var lbl = RowLabel(label);
+            var field = new Field(value) { Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = Theme.P(0, 3, 6, 3) };
+            var btn = new UiButton("", Glyph.Dots, ButtonKind.Normal) { Margin = Theme.P(0, 3, 0, 3) };
             btn.Click += browse;
-            tbl.Controls.Add(lbl, 0, row);
-            tbl.Controls.Add(txt, 1, row);
-            tbl.Controls.Add(btn, 2, row);
-            settingsControls.Add(txt);
+            tips.SetToolTip(btn, "Выбрать…");
+            if (hint != null) SetCueBanner(field.Box, hint);
+            t.Controls.Add(lbl, 0, row);
+            t.Controls.Add(field, 1, row);
+            t.Controls.Add(btn, 2, row);
+            settingsControls.Add(field);
             settingsControls.Add(btn);
-            return txt;
+            if (group != null) group.AddRange(new Control[] { lbl, field, btn });
+            return field.Box;
         }
 
-        TextBox AddTextRow(TableLayoutPanel tbl, int row, string label, string value)
+        TextBox AddTextRow(TableLayoutPanel t, string label, string value, string hint, List<Control> group)
         {
-            var lbl = new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 6, 8, 3) };
-            var txt = new TextBox { Text = value, Dock = DockStyle.Fill, Margin = new Padding(3, 3, 3, 3) };
-            tbl.Controls.Add(lbl, 0, row);
-            tbl.Controls.Add(txt, 1, row);
-            settingsControls.Add(txt);
-            return txt;
+            int row = NextRow(t);
+            var lbl = RowLabel(label);
+            var field = new Field(value) { Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = Theme.P(0, 3, 6, 3) };
+            if (hint != null) SetCueBanner(field.Box, hint);
+            t.Controls.Add(lbl, 0, row);
+            t.Controls.Add(field, 1, row);
+            settingsControls.Add(field);
+            if (group != null) group.AddRange(new Control[] { lbl, field });
+            return field.Box;
+        }
+
+        IntField AddNumber(TableLayoutPanel nums, int col, string label, int min, int max, int value, string suffix, string tip)
+        {
+            var lbl = new Label { Text = label, AutoSize = true, Font = Theme.Small, ForeColor = Theme.TextDim, Margin = Theme.P(0, 0, 0, 4) };
+            var field = new IntField(min, max, value, suffix)
+            {
+                Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = col < 2 ? Theme.P(0, 0, 12, 0) : Padding.Empty,
+            };
+            tips.SetToolTip(lbl, tip);
+            tips.SetToolTip(field.Box, tip);
+            nums.Controls.Add(lbl, col, 0);
+            nums.Controls.Add(field, col, 1);
+            settingsControls.Add(field);
+            return field;
         }
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -478,24 +698,6 @@ namespace RenderCrashSolver
                 if (Directory.Exists(target.Text)) dlg.SelectedPath = target.Text;
                 if (dlg.ShowDialog(this) == DialogResult.OK) target.Text = dlg.SelectedPath;
             }
-        }
-
-        NumericUpDown AddNumber(FlowLayoutPanel flow, string label, int min, int max, int value)
-        {
-            var lbl = new Label { Text = label, AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
-            var num = new NumericUpDown { Minimum = min, Maximum = max, Width = 64, Margin = new Padding(3, 3, 18, 3) };
-            num.Value = Math.Max(min, Math.Min(max, value));
-            flow.Controls.Add(lbl);
-            flow.Controls.Add(num);
-            settingsControls.Add(num);
-            return num;
-        }
-
-        Button MakeButton(string text, EventHandler click)
-        {
-            var b = new Button { Text = text, AutoSize = true, Padding = new Padding(10, 3, 10, 3), Margin = new Padding(0, 0, 8, 0) };
-            b.Click += click;
-            return b;
         }
 
         void BrowseFile(TextBox target, string filter)
@@ -524,7 +726,13 @@ namespace RenderCrashSolver
 
         void SetRunningUi(bool running)
         {
-            foreach (Control c in settingsControls) c.Enabled = !running;
+            // fields stay readable (and copyable) while locked; everything else is disabled
+            foreach (Control c in settingsControls)
+            {
+                var field = c as Field;
+                if (field != null) field.Locked = running;
+                else c.Enabled = !running;
+            }
             btnStart.Enabled = !running;
             btnStop.Enabled = running;
             UpdateOutputUi();
@@ -541,18 +749,17 @@ namespace RenderCrashSolver
 
         void UpdateOutputUi()
         {
-            bool editable = chkCustomOutput.Enabled && chkCustomOutput.Checked;
-            txtOutputDir.Enabled = editable;
-            btnOutputBrowse.Enabled = editable;
-            txtOutputPrefix.Enabled = editable;
+            bool custom = chkCustomOutput.Checked;
+            foreach (Control c in customOutputRows) c.Visible = custom;
 
             string effective = EffectiveOutputPath();
-            if (!chkCustomOutput.Checked)
+            if (!custom)
                 lblEffectivePath.Text = "";
             else if (effective == null)
                 lblEffectivePath.Text = "Кадры будут сохраняться в: (прочитайте сцену кнопкой ↻)";
             else
                 lblEffectivePath.Text = "Кадры будут сохраняться в:  " + FramePathDisplay(effective);
+            tips.SetToolTip(lblEffectivePath, effective != null && custom ? FramePathDisplay(effective) : null);
 
             // while rendering the preview follows the path reported by Blender itself
             if (btnStart.Enabled && effective != null && sceneExt != null)
@@ -588,13 +795,14 @@ namespace RenderCrashSolver
             if (!File.Exists(blender) || !File.Exists(blend) || !File.Exists(ScriptPath))
             {
                 sceneFilepath = null;
-                lblScenePath.Text = "— (укажите blender.exe и .blend)";
+                sceneTotal = sceneDone = 0;
+                SetSceneText("—", "укажите blender.exe и .blend", Theme.TextDim);
                 UpdateOutputUi();
                 return;
             }
 
             int id = ++infoRequestId;
-            lblScenePath.Text = "Читаю сцену в Blender…";
+            SetSceneText(lblScenePath.Text, "читаю сцену в Blender…", Theme.TextDim);
             var psi = new ProcessStartInfo(blender,
                 string.Format("-b \"{0}\" --python-exit-code {1} -P \"{2}\" -- --info", blend, ScriptErrorExitCode, ScriptPath))
             {
@@ -632,8 +840,18 @@ namespace RenderCrashSolver
             }
             catch (Exception ex)
             {
-                lblScenePath.Text = "Не удалось запустить Blender: " + ex.Message;
+                SetSceneText("—", "Не удалось запустить Blender: " + ex.Message, Theme.Red);
             }
+        }
+
+        // path line in the normal colour once the scene is known; the line under it carries frames / status / problems
+        void SetSceneText(string path, string meta, Color metaColor)
+        {
+            lblScenePath.Text = path;
+            lblScenePath.ForeColor = sceneFilepath != null ? Theme.Text : Theme.TextDim;
+            tips.SetToolTip(lblScenePath, sceneFilepath != null ? path + "\nКлик — открыть папку" : null);
+            lblSceneMeta.Text = meta;
+            lblSceneMeta.ForeColor = metaColor;
         }
 
         void ApplySceneInfo(int id, Process p, List<string> lines)
@@ -644,6 +862,7 @@ namespace RenderCrashSolver
 
             string path = null, frames = null, status = null;
             string ext = null;
+            int rangeTotal = 0, rangeDone = 0;
             lock (lines)
             {
                 foreach (string msg in lines)
@@ -658,7 +877,12 @@ namespace RenderCrashSolver
                     else if (msg.StartsWith("STATUS "))
                     {
                         Match m = StatusRe.Match(msg);
-                        if (m.Success) status = string.Format("готово {0} из {1}", m.Groups[2].Value, m.Groups[1].Value);
+                        if (m.Success)
+                        {
+                            rangeTotal = int.Parse(m.Groups[1].Value);
+                            rangeDone = int.Parse(m.Groups[2].Value);
+                            status = string.Format("готово {0} из {1}", rangeDone, rangeTotal);
+                        }
                     }
                 }
             }
@@ -666,18 +890,24 @@ namespace RenderCrashSolver
             if (path == null)
             {
                 sceneFilepath = null;
-                lblScenePath.Text = "Не удалось прочитать сцену (подробности — при запуске рендера в логе)";
+                sceneTotal = sceneDone = 0;
+                SetSceneText("—", "Не удалось прочитать сцену (подробности — в журнале при запуске рендера)", Theme.Orange);
                 UpdateOutputUi();
                 return;
             }
             sceneFilepath = path;
             sceneExt = ext == "FFMPEG" ? null : ext;
-            string text = ext == "FFMPEG"
-                ? path + "   (видео FFMPEG — продолжение по кадрам невозможно, переключите на JPG/PNG/EXR)"
-                : FramePathDisplay(path);
-            if (frames != null) text += "     ·  " + frames;
-            if (status != null) text += "  ·  " + status;
-            lblScenePath.Text = text;
+            sceneTotal = rangeTotal;
+            sceneDone = rangeDone;
+            if (ext == "FFMPEG")
+                SetSceneText(path, "Видео FFMPEG: продолжение по кадрам невозможно, переключите вывод на JPG/PNG/EXR", Theme.Orange);
+            else
+            {
+                var meta = new List<string>();
+                if (frames != null) meta.Add(frames);
+                if (status != null) meta.Add(status);
+                SetSceneText(FramePathDisplay(path), string.Join("  ·  ", meta.ToArray()), Theme.TextDim);
+            }
             UpdateOutputUi();
         }
 
@@ -698,9 +928,9 @@ namespace RenderCrashSolver
             settings.CustomOutput = chkCustomOutput.Checked;
             settings.Override = chkOverride.Checked;
             settings.LogDir = txtLogDir.Text.Trim().Trim('"');
-            settings.MaxRetries = (int)numRetries.Value;
-            settings.RetryPauseSec = (int)numPause.Value;
-            settings.HangTimeoutMin = (int)numHang.Value;
+            settings.MaxRetries = numRetries.Value;
+            settings.RetryPauseSec = numPause.Value;
+            settings.HangTimeoutMin = numHang.Value;
         }
 
         void StartSession()
@@ -772,7 +1002,7 @@ namespace RenderCrashSolver
                 outputDir = null;
             }
             if (txtLog.TextLength > 0) AddUi("");
-            AddUi("Старт: " + Path.GetFileName(settings.BlendFile));
+            AddUi("Старт: " + Path.GetFileName(settings.BlendFile), LogKind.Section);
             if (settings.CustomOutput)
                 AddUi(string.Format("Другая папка вывода: папка = {0}, имя = {1}",
                     settings.OutputDir.Length > 0 ? settings.OutputDir : "(из сцены)",
@@ -808,10 +1038,10 @@ namespace RenderCrashSolver
                 catch (Exception ex)
                 {
                     logWriter = null;
-                    uiLines.Enqueue(Stamp("Не удалось открыть файл лога: " + ex.Message));
+                    uiLines.Enqueue(Line("Не удалось открыть файл лога: " + ex.Message, LogKind.Error));
                 }
             }
-            AddUi(string.Format("── Попытка #{0} из {1} ──", attempt, settings.MaxRetries));
+            AddUi(string.Format("── Попытка #{0} из {1} ──", attempt, settings.MaxRetries), LogKind.Section);
 
             // everything after "--" is ignored by Blender and read by resume_render.py
             var args = new StringBuilder();
@@ -876,20 +1106,20 @@ namespace RenderCrashSolver
             }
 
             if (killedByWatchdog)
-                AddUi("Blender остановлен из-за зависания.");
+                AddUi("Blender остановлен из-за зависания.", LogKind.Warning);
             else if (code != 0)
             {
                 crashes++;
                 if (code == RenderErrorExitCode)
-                    AddUi("Рендер прервался с ошибкой внутри Blender (чаще всего сбой видеокарты / CUDA).");
+                    AddUi("Рендер прервался с ошибкой внутри Blender (чаще всего сбой видеокарты / CUDA).", LogKind.Error);
                 else
-                    AddUi(string.Format("Blender упал: код {0} (0x{0:X8}).", code));
+                    AddUi(string.Format("Blender упал: код {0} (0x{0:X8}).", code), LogKind.Error);
                 if (settings.TgOnCrash && attempt < settings.MaxRetries)
                     NotifyTelegram(string.Format("⚠ Blender упал (код 0x{0:X8}), перезапуск через {1} с — попытка {2} из {3}.",
                         code, settings.RetryPauseSec, attempt + 1, settings.MaxRetries), false);
             }
             else
-                AddUi("Blender завершился (код 0), но завершение рендера не подтверждено — перезапуск.");
+                AddUi("Blender завершился (код 0), но завершение рендера не подтверждено — перезапуск.", LogKind.Warning);
 
             if (attempt >= settings.MaxRetries)
             {
@@ -921,7 +1151,7 @@ namespace RenderCrashSolver
             state = final;
             finishMessage = message;
             sessionEnd = DateTime.Now;
-            AddUi("■ " + message);
+            AddUi("■ " + message, final == RunState.Done ? LogKind.Success : final == RunState.Failed ? LogKind.Error : LogKind.Event);
             SetRunningUi(false);
             SetThreadExecutionState(ES_CONTINUOUS);
             UpdateLabels();
@@ -933,18 +1163,20 @@ namespace RenderCrashSolver
                 chkOverride.Checked = false;
                 settings.Override = false;
                 settings.Save();
-                AddUi("Override завершён: все кадры отрендерены заново, галочка снята.");
+                AddUi("Override завершён: все кадры отрендерены заново, галочка снята.", LogKind.Success);
             }
 
             if (final == RunState.Done)
             {
                 SystemSounds.Asterisk.Play();
                 tray.ShowBalloonTip(15000, "Рендер завершён", Path.GetFileName(settings.BlendFile) + ": " + message, ToolTipIcon.Info);
+                Theme.Flash(this);
             }
             else if (final == RunState.Failed)
             {
                 SystemSounds.Hand.Play();
                 tray.ShowBalloonTip(15000, "Рендер остановлен с ошибкой", message, ToolTipIcon.Error);
+                Theme.Flash(this);
             }
 
             if (final == RunState.Done && settings.TgOnDone)
@@ -976,17 +1208,18 @@ namespace RenderCrashSolver
 
         void UpdateOverrideText()
         {
-            chkOverride.Text = chkOverride.Checked && settings.OverrideSince > 0
-                ? string.Format("Override — перерендерить все кадры заново (начат {0:dd.MM HH:mm}, продолжится с места остановки)",
-                    FromUnixSeconds(settings.OverrideSince))
-                : "Override — перерендерить все кадры заново (старые кадры перезаписываются)";
+            chkOverride.Description = chkOverride.Checked && settings.OverrideSince > 0
+                ? string.Format("Начат {0:dd.MM HH:mm}, продолжится с места остановки.", FromUnixSeconds(settings.OverrideSince))
+                : "Старые кадры перезаписываются по ходу рендера.";
         }
 
         // ─── Telegram ────────────────────────────────────────────
 
         void UpdateTelegramButton()
         {
-            btnTelegram.Text = settings.TgEnabled ? "Telegram ✓" : "Telegram…";
+            int chats = TelegramApi.ParseChatIds(settings.TgChats).Count;
+            lblTelegram.Text = settings.TgEnabled ? string.Format("включено, получателей: {0}", chats) : "выключено";
+            lblTelegram.ForeColor = settings.TgEnabled ? Theme.Green : Theme.TextDim;
         }
 
         /// <summary>Sends headline + session details to all configured chats on a background thread.</summary>
@@ -1021,9 +1254,9 @@ namespace RenderCrashSolver
                 }
                 lock (sync)
                 {
-                    uiLines.Enqueue(Stamp(errors.Count == 0
-                        ? string.Format("Telegram: уведомление отправлено ({0})", chats.Count)
-                        : "Telegram: не удалось отправить — " + string.Join("; ", errors)));
+                    uiLines.Enqueue(errors.Count == 0
+                        ? Line(string.Format("Telegram: уведомление отправлено ({0})", chats.Count), LogKind.Event)
+                        : Line("Telegram: не удалось отправить — " + string.Join("; ", errors), LogKind.Warning));
                 }
             });
         }
@@ -1069,7 +1302,7 @@ namespace RenderCrashSolver
                 {
                     // the same modifier warnings repeat every frame - show each kind once
                     if (seenWarnings.Count < 1000 && seenWarnings.Add(DigitsRe.Replace(line, "#")))
-                        uiLines.Enqueue(Stamp("⚠ " + ShortenWarning(line.Trim())));
+                        uiLines.Enqueue(Line(ShortenWarning(line.Trim()), LogKind.Warning));
                 }
                 else if (line.IndexOf("Error", StringComparison.OrdinalIgnoreCase) >= 0 ||
                     line.IndexOf("EXCEPTION", StringComparison.Ordinal) >= 0 ||
@@ -1077,7 +1310,7 @@ namespace RenderCrashSolver
                     line.StartsWith("  File \"", StringComparison.Ordinal) ||
                     line.IndexOf(".crash.txt", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    uiLines.Enqueue(Stamp(line));
+                    uiLines.Enqueue(Line(line, LogKind.Error));
                 }
             }
         }
@@ -1102,7 +1335,7 @@ namespace RenderCrashSolver
                 int frameNo;
                 if (parts.Length >= 4 && int.TryParse(parts[1], out frameNo))
                     pendingFrames.Add(new KeyValuePair<int, string>(frameNo, parts[3].Trim()));
-                uiLines.Enqueue(Stamp(string.Format("Кадр {0} готов за {1}", parts.Length >= 2 ? parts[1] : "?", FormatDuration(secs))));
+                uiLines.Enqueue(Line(string.Format("Кадр {0} готов за {1}", parts.Length >= 2 ? parts[1] : "?", FormatDuration(secs)), LogKind.Frame));
                 return;
             }
             if (msg.StartsWith("STATUS "))
@@ -1112,7 +1345,7 @@ namespace RenderCrashSolver
                 {
                     total = int.Parse(m.Groups[1].Value);
                     done = int.Parse(m.Groups[2].Value);
-                    uiLines.Enqueue(Stamp(string.Format("Кадров в диапазоне: {0}, готово: {1}, осталось: {2}", total, done, total - done)));
+                    uiLines.Enqueue(Line(string.Format("Кадров в диапазоне: {0}, готово: {1}, осталось: {2}", total, done, total - done), LogKind.Event));
                 }
                 return;
             }
@@ -1124,17 +1357,20 @@ namespace RenderCrashSolver
             if (msg.StartsWith("OUTPUT_PATH "))
             {
                 pendingSequencePath = msg.Substring(12).Trim();
-                uiLines.Enqueue(Stamp("Путь вывода: " + pendingSequencePath + (renderExt != null ? "####." + renderExt : "")));
+                uiLines.Enqueue(Line("Путь вывода: " + pendingSequencePath + (renderExt != null ? "####." + renderExt : ""), LogKind.Event));
                 return;
             }
             if (msg.StartsWith("OUTPUT_DIR "))
             {
                 outputDir = msg.Substring(11).Trim();
-                uiLines.Enqueue(Stamp("Папка рендера: " + outputDir));
+                uiLines.Enqueue(Line("Папка рендера: " + outputDir, LogKind.Event));
                 return;
             }
-            if (msg.StartsWith("ALL_FRAMES_DONE")) allDoneSeen = true;
-            uiLines.Enqueue(Stamp(msg));
+            LogKind kind = LogKind.Event;
+            if (msg.StartsWith("ALL_FRAMES_DONE")) { allDoneSeen = true; kind = LogKind.Success; }
+            else if (msg.StartsWith("RENDER_ERROR") || msg.StartsWith("ERROR")) kind = LogKind.Error;
+            else if (msg.StartsWith("WARN")) kind = LogKind.Warning;
+            uiLines.Enqueue(Line(msg, kind));
         }
 
         // "WARN (bke.modifier): C:\...\modifier.cc:424 BKE_modifier_set_error: Object: ..." -> "WARN (bke.modifier): Object: ..."
@@ -1145,25 +1381,26 @@ namespace RenderCrashSolver
             return WarnSourceRe.Replace(line, "$1 ");
         }
 
-        static string Stamp(string text)
+        // an empty text is a blank separator line without a time stamp
+        static LogLine Line(string text, LogKind kind)
         {
-            return text.Length == 0 ? "" : DateTime.Now.ToString("HH:mm:ss") + "  " + text;
+            return new LogLine { Time = text.Length == 0 ? "" : DateTime.Now.ToString("HH:mm:ss"), Text = text, Kind = kind };
         }
 
-        void AddUi(string text)
+        void AddUi(string text, LogKind kind = LogKind.Event)
         {
-            lock (sync) uiLines.Enqueue(Stamp(text));
+            lock (sync) uiLines.Enqueue(Line(text, kind));
             DrainUi();
         }
 
         void DrainUi()
         {
-            var sb = new StringBuilder();
+            var lines = new List<LogLine>();
             string seqPath, seqExt;
             List<KeyValuePair<int, string>> newFrames = null;
             lock (sync)
             {
-                while (uiLines.Count > 0) sb.Append(uiLines.Dequeue()).Append(Environment.NewLine);
+                while (uiLines.Count > 0) lines.Add(uiLines.Dequeue());
                 seqPath = pendingSequencePath;
                 seqExt = renderExt;
                 pendingSequencePath = null;
@@ -1177,9 +1414,7 @@ namespace RenderCrashSolver
             if (newFrames != null)
                 foreach (var f in newFrames) preview.AddFrame(f.Key, f.Value);
 
-            if (sb.Length == 0) return;
-            if (txtLog.TextLength > 400000) txtLog.Text = txtLog.Text.Substring(txtLog.TextLength - 200000);
-            txtLog.AppendText(sb.ToString());
+            txtLog.Append(lines);
         }
 
         // ─── periodic update ─────────────────────────────────────
@@ -1198,7 +1433,7 @@ namespace RenderCrashSolver
                 {
                     killedByWatchdog = true;
                     hangs++;
-                    AddUi(string.Format("Нет нового кадра {0} мин — считаю, что Blender завис, перезапускаю.", settings.HangTimeoutMin));
+                    AddUi(string.Format("Нет нового кадра {0} мин — считаю, что Blender завис, перезапускаю.", settings.HangTimeoutMin), LogKind.Warning);
                     try { proc.Kill(); } catch { }
                 }
             }
@@ -1226,6 +1461,7 @@ namespace RenderCrashSolver
             int t, d, cur;
             double last = 0, avg = 0;
             bool hasOutput;
+            string dir = null;
             lock (sync)
             {
                 t = total; d = done; cur = currentFrame;
@@ -1238,59 +1474,95 @@ namespace RenderCrashSolver
                     avg = sum / n;
                 }
                 hasOutput = !string.IsNullOrEmpty(outputDir);
+                if (hasOutput) dir = outputDir;
             }
             btnOutput.Enabled = hasOutput;
+            // before the first Start of this run of the program: what the scene's output folder already holds
+            if (attempt == 0 && sceneTotal > 0) { t = sceneTotal; d = sceneDone; }
 
             int pct = t > 0 ? (int)(100L * d / t) : 0;
+            bool active = state == RunState.Rendering || state == RunState.Waiting;
+            Color bar = Theme.TextFaint;
             switch (state)
             {
                 case RunState.Idle:
-                    SetStatus("Готов к запуску", SystemColors.ControlText); break;
+                    SetStatus("", "Готов к запуску", Theme.Text, Theme.Text); break;
                 case RunState.Rendering:
-                    SetStatus(cur > 0 ? "Рендер идёт — кадр " + cur : "Blender загружает сцену…", Color.FromArgb(0, 90, 170)); break;
+                    SetStatus("РЕНДЕР", cur > 0 ? "Рендерится кадр " + cur : "Blender загружает сцену…", Theme.AccentText, Theme.Text);
+                    bar = Theme.Accent; break;
                 case RunState.Waiting:
                     int left = Math.Max(0, (int)Math.Ceiling((retryAt - DateTime.Now).TotalSeconds));
-                    SetStatus(string.Format("Перезапуск через {0} с…", left), Color.FromArgb(190, 110, 0)); break;
+                    SetStatus("ПЕРЕЗАПУСК", string.Format("Новая попытка через {0} с…", left), Theme.Orange, Theme.Orange);
+                    bar = Theme.Orange; break;
                 case RunState.Done:
-                    SetStatus("Готово ✔  " + finishMessage, Color.FromArgb(20, 130, 50)); break;
+                    SetStatus("ГОТОВО", finishMessage, Theme.Green, Theme.Green);
+                    bar = Theme.Green; break;
                 case RunState.Stopped:
-                    SetStatus(finishMessage, SystemColors.ControlText); break;
+                    SetStatus("СТОП", finishMessage, Theme.TextDim, Theme.Text); break;
                 case RunState.Failed:
-                    SetStatus("Ошибка: " + finishMessage, Color.FromArgb(190, 30, 30)); break;
+                    SetStatus("ОШИБКА", finishMessage, Theme.Red, Theme.Red);
+                    bar = Theme.Red; break;
             }
+            progress.Set(d, t, bar);
 
-            progress.Maximum = Math.Max(t, 1);
-            progress.Value = Math.Min(d, progress.Maximum);
-
-            lblFrames.Text = t > 0
-                ? string.Format("Кадры: {0} / {1}  ({2}%)     Осталось: {3}", d, t, pct, t - d)
-                : "Кадры: —";
-            lblAttempts.Text = string.Format("Попытка: {0} / {1}     Крашей: {2}     Зависаний: {3}",
-                attempt, settings.MaxRetries, crashes, hangs);
-
-            bool active = state == RunState.Rendering || state == RunState.Waiting;
-            string times = "";
-            if (attempt > 0)
+            string blend = attempt > 0 ? settings.BlendFile : txtBlend.Text.Trim().Trim('"');
+            string subtitle = blend.Length == 0 ? "Укажите Blender и сцену .blend, затем нажмите «Старт»" : Path.GetFileName(blend);
+            if (blend.Length > 0 && dir == null && sceneFilepath != null)
             {
-                TimeSpan elapsed = (active ? DateTime.Now : sessionEnd) - sessionStart;
-                times = "Прошло: " + FormatDuration(elapsed.TotalSeconds);
+                string effective = EffectiveOutputPath();
+                if (effective != null) dir = Path.GetDirectoryName(effective);
             }
-            if (last > 0) times += "     Последний кадр: " + FormatDuration(last) + "     Средний: " + FormatDuration(avg);
+            if (blend.Length > 0 && dir != null) subtitle += "   →   " + dir;
+            if (lblSubtitle.Text != subtitle) lblSubtitle.Text = subtitle;
+
+            tileFrames.Set(t > 0 ? string.Format("{0} / {1}", d, t) : "—",
+                t > 0 ? string.Format("{0}% · осталось {1}", pct, t - d) : "", Theme.Text);
             if (active && avg > 0 && t > d)
             {
                 double eta = avg * (t - d);
-                times += string.Format("     Осталось ≈ {0} (к {1:HH:mm, dd.MM})", FormatDuration(eta), DateTime.Now.AddSeconds(eta));
+                tileEta.Set("≈ " + FormatDuration(eta), string.Format("к {0:HH:mm, dd.MM}", DateTime.Now.AddSeconds(eta)), Theme.Text);
             }
-            lblTimes.Text = times.Length > 0 ? times : "Время: —";
+            else
+                tileEta.Set(state == RunState.Done ? "0:00" : "—", "", Theme.Text);
+            tileAvg.Set(avg > 0 ? FormatDuration(avg) : "—", last > 0 ? "последний " + FormatDuration(last) : "", Theme.Text);
+            if (attempt > 0)
+            {
+                TimeSpan elapsed = (active ? DateTime.Now : sessionEnd) - sessionStart;
+                tileElapsed.Set(FormatDuration(elapsed.TotalSeconds), string.Format("старт в {0:HH:mm}", sessionStart), Theme.Text);
+            }
+            else
+                tileElapsed.Set("—", "", Theme.Text);
+            tileAttempts.Set(attempt > 0 ? string.Format("{0} / {1}", attempt, settings.MaxRetries) : "—",
+                attempt > 0 ? string.Format("крашей {0} · зависаний {1}", crashes, hangs) : "", crashes + hangs > 0 ? Theme.Orange : Theme.Text);
 
             string title = active && t > 0 ? string.Format("{0}% — {1}", pct, AppTitle) : AppTitle;
             if (Text != title) Text = title;
+            string tip = active && t > 0 ? string.Format("RenderCrashSolver — {0}% ({1} / {2})", pct, d, t) : "RenderCrashSolver";
+            if (tray.Text != tip) tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
+            UpdateTaskbar(t, d);
         }
 
-        void SetStatus(string text, Color color)
+        void SetStatus(string badgeText, string text, Color badgeColor, Color textColor)
         {
+            badge.Set(badgeText, badgeColor);
             if (lblStatus.Text != text) lblStatus.Text = text;
-            if (lblStatus.ForeColor != color) lblStatus.ForeColor = color;
+            if (lblStatus.ForeColor != textColor) lblStatus.ForeColor = textColor;
+        }
+
+        // progress on the taskbar button: blue while rendering, yellow while waiting to restart, red after a failure
+        void UpdateTaskbar(int t, int d)
+        {
+            if (!IsHandleCreated || !Visible) return;
+            TaskbarState s = TaskbarState.None;
+            if (state == RunState.Rendering) s = t > 0 ? TaskbarState.Normal : TaskbarState.Indeterminate;
+            else if (state == RunState.Waiting) s = TaskbarState.Paused;
+            else if (state == RunState.Failed) s = TaskbarState.Error;
+            int value = t > 0 ? d : 1, max = Math.Max(1, t);
+            if (s == taskbarState && value == taskbarValue && max == taskbarTotal) return;
+            taskbarState = s;
+            taskbarValue = value;
+            taskbarTotal = max;
+            Taskbar.Set(Handle, s, value, max);
         }
 
         static string FormatDuration(double seconds)

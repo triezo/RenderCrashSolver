@@ -7,7 +7,7 @@ if not exist "%CSC%" set CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe
 "%CSC%" /nologo /codepage:65001 /target:winexe /optimize+ /define:TELEGRAM ^
     /out:"%~dp0RenderCrashSolver.exe" ^
     /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll ^
-    "%~dp0RenderCrashSolver.cs" "%~dp0PreviewPanel.cs" "%~dp0Telegram.cs"
+    "%~dp0RenderCrashSolver.cs" "%~dp0PreviewPanel.cs" "%~dp0Telegram.cs" "%~dp0Theme.cs"
 
 if errorlevel 1 (
     echo BUILD FAILED
