@@ -2,10 +2,12 @@
 resume_render.py - resume animation render after a Blender crash.
 
 Called by RenderCrashSolver.exe or run_render.bat via:
-blender -b file.blend -P resume_render.py [-- --output-dir DIR] [--prefix NAME] [--override-since UNIX_TS]
-blender -b file.blend -P resume_render.py -- --info   (only print SCENE_* lines, no render)
+blender -b file.blend -P resume_render.py [-- --output-dir DIR] [--prefix NAME] [--override-since UNIX_TS] [--frames SPEC]
+blender -b file.blend -P resume_render.py -- --info [--frames SPEC]   (only print SCENE_* lines, no render)
 
 Logic:
+- Frames: the scene range with the scene's frame step, or --frames "1-100,120,150-200" (exactly those frames;
+  each run of consecutive frames is rendered as its own animation render)
 - Optionally renders to a different output folder and/or file name prefix (custom output)
 - Scans the output folder for already-rendered frame files with that prefix
 - Broken frames (empty / truncated JPG or PNG) are renamed to *.broken and re-rendered
@@ -13,16 +15,16 @@ Logic:
   so holes in the middle of the range do not cause re-rendering of finished frames
 - Override (--override-since): re-render everything. Frames saved before that time count as stale
   and are overwritten; frames saved after it belong to this re-render, so a crash resumes it
-- Prints ALL_FRAMES_DONE when every frame of the range is on disk
+- Prints ALL_FRAMES_DONE when every selected frame is on disk
 
 Machine-readable lines for the GUI (all start with "[resume_render] "):
   OUTPUT_EXT <ext>
   OUTPUT_PATH <scene.render.filepath, absolute, custom output applied>
   OUTPUT_DIR <path>
-  STATUS total=<n> done=<n> missing=<n>
+  STATUS total=<n> done=<n> missing=<n>        (counts of the selected frames)
   FRAME_START <frame>
   FRAME_DONE <frame> <seconds> <saved file path>
-  (--info mode: SCENE_PATH, SCENE_FRAMES, SCENE_EXT, STATUS)
+  (--info mode: SCENE_PATH, SCENE_FRAMES <start> <end> <step>, SCENE_EXT, STATUS)
   ALL_FRAMES_DONE ...
 """
 
@@ -65,8 +67,42 @@ def parse_args():
     parser.add_argument("--prefix", help="file name prefix, e.g. shot_ (instead of the scene name)")
     parser.add_argument("--override-since", type=float,
                         help="re-render all frames: files saved before this unix time are stale and get overwritten")
+    parser.add_argument("--frames", help="render only these frames, e.g. 1-100,120,150-200 (instead of the scene range)")
     parser.add_argument("--info", action="store_true", help="only print the scene output settings, do not render")
     return parser.parse_args(argv)
+
+
+# Blender's MAXFRAME
+MAX_FRAME = 1048574
+
+
+def parse_frames(spec):
+    """'1-100, 120 150-200' -> set of frame numbers. ValueError for anything else."""
+    frames = set()
+    for part in re.split(r"[,;\s]+", spec.strip()):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            raise ValueError(f"cannot read frames {part!r}: use numbers and ranges like 1-100,120")
+        first, last = int(m.group(1)), int(m.group(2) or m.group(1))
+        if last < first or last > MAX_FRAME:
+            raise ValueError(f"bad frame range {part!r}")
+        frames.update(range(first, last + 1))
+    if not frames:
+        raise ValueError("no frames selected")
+    return frames
+
+
+def frame_segments(frames, step):
+    """Runs of frames that are `step` apart: {1,2,3,7,8} with step 1 -> [(1, 3), (7, 8)]."""
+    segments = []
+    for f in sorted(frames):
+        if segments and f == segments[-1][1] + step:
+            segments[-1][1] = f
+        else:
+            segments.append([f, f])
+    return [(a, b) for a, b in segments]
 
 
 def apply_custom_output(scene, args):
@@ -199,19 +235,25 @@ def main():
 
     frame_start = FRAME_START_OVERRIDE if FRAME_START_OVERRIDE is not None else scene.frame_start
     frame_end = FRAME_END_OVERRIDE if FRAME_END_OVERRIDE is not None else scene.frame_end
+    scene_step = max(1, scene.frame_step)
 
-    full_range = set(range(frame_start, frame_end + 1))
+    # the frames to have on disk: the scene range (with the scene's step, which Blender honours too)
+    # or exactly the frames given with --frames
+    if args.frames:
+        selection, step = parse_frames(args.frames), 1
+    else:
+        selection, step = set(range(frame_start, frame_end + 1, scene_step)), scene_step
 
     if args.info:
         # read-only query for the GUI: the scene's own output path, before a custom output is applied
         ext = get_file_ext(scene)
         log(f"SCENE_PATH {bpy.path.abspath(scene.render.filepath)}")
-        log(f"SCENE_FRAMES {frame_start} {frame_end}")
+        log(f"SCENE_FRAMES {frame_start} {frame_end} {scene_step}")
         log(f"SCENE_EXT {ext or 'FFMPEG'}")
         if ext:
             rendered = find_rendered_frames(get_output_dir(scene), get_frame_pattern(scene, ext), ext,
-                                            fix_broken=False) & full_range
-            log(f"STATUS total={len(full_range)} done={len(rendered)} missing={len(full_range) - len(rendered)}")
+                                            fix_broken=False) & selection
+            log(f"STATUS total={len(selection)} done={len(rendered)} missing={len(selection) - len(rendered)}")
         return
 
     apply_custom_output(scene, args)
@@ -231,45 +273,52 @@ def main():
     log(f"OUTPUT_DIR {output_dir}")
 
     stale = set()
-    rendered = find_rendered_frames(output_dir, pattern, ext, stale_before=override_since, stale=stale) & full_range
-    missing = sorted(full_range - rendered)
-    log(f"STATUS total={len(full_range)} done={len(rendered)} missing={len(missing)}")
+    rendered = find_rendered_frames(output_dir, pattern, ext, stale_before=override_since, stale=stale) & selection
+    missing = sorted(selection - rendered)
+    log(f"STATUS total={len(selection)} done={len(rendered)} missing={len(missing)}")
     describe_existing(output_dir, pattern, rendered)
     if override_since is not None:
         since = time.strftime('%Y-%m-%d %H:%M', time.localtime(override_since))
-        log(f"Override: re-rendering all frames; {len(stale & full_range)} files saved before {since} "
+        log(f"Override: re-rendering all frames; {len(stale & selection)} files saved before {since} "
             f"will be overwritten, {len(rendered)} already re-rendered")
 
     if not missing:
         log("ALL_FRAMES_DONE - all frames already rendered.")
         return
 
-    resume_from = missing[0]
-    log(f"Found {len(rendered)} finished frames. Missing: {len(missing)}. Resuming from frame {resume_from}.")
+    log(f"Found {len(rendered)} finished frames. Missing: {len(missing)}. Resuming from frame {missing[0]}.")
 
-    scene.frame_start = resume_from
-    scene.frame_end = frame_end
     # normally: skip frames that already exist on disk instead of overwriting them.
     # Override: stale files must be overwritten. The re-render goes in order, so every frame from
-    # resume_from on is stale or missing and nothing re-rendered in this session gets redone.
+    # the first missing one of a segment on is stale or missing and nothing re-rendered gets redone.
     scene.render.use_overwrite = override_since is not None
     scene.render.use_placeholder = False
 
     bpy.app.handlers.render_pre.append(on_render_pre)
     bpy.app.handlers.render_write.append(on_render_write)
 
-    try:
-        bpy.ops.render.render(animation=True)
-    except RuntimeError as e:
-        # Cycles reports GPU failures (e.g. CUDA "Illegal address") as an exception, not a crash.
-        # Exit hard with a dedicated code: the GPU context is broken, a fresh Blender has to continue.
-        message = str(e).strip().splitlines()
-        log(f"RENDER_ERROR {message[0] if message else repr(e)}")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(RENDER_ERROR_EXIT_CODE)
+    segments = frame_segments(selection, step)
+    for seg_start, seg_end in segments:
+        seg_missing = [f for f in missing if seg_start <= f <= seg_end]
+        if not seg_missing:
+            continue
+        if len(segments) > 1:
+            log(f"Rendering frames {seg_missing[0]}-{seg_end}" if seg_missing[0] != seg_end else f"Rendering frame {seg_end}")
+        scene.frame_start = seg_missing[0]
+        scene.frame_end = seg_end
+        scene.frame_step = step
+        try:
+            bpy.ops.render.render(animation=True)
+        except RuntimeError as e:
+            # Cycles reports GPU failures (e.g. CUDA "Illegal address") as an exception, not a crash.
+            # Exit hard with a dedicated code: the GPU context is broken, a fresh Blender has to continue.
+            message = str(e).strip().splitlines()
+            log(f"RENDER_ERROR {message[0] if message else repr(e)}")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(RENDER_ERROR_EXIT_CODE)
 
-    still_missing = sorted(full_range - find_rendered_frames(output_dir, pattern, ext, stale_before=override_since))
+    still_missing = sorted(selection - find_rendered_frames(output_dir, pattern, ext, stale_before=override_since))
     if still_missing:
         log(f"Render finished but {len(still_missing)} frames are still missing (first: {still_missing[0]}).")
     else:

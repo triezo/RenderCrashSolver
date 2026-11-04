@@ -40,6 +40,8 @@ namespace RenderCrashSolver
         public string OutputDir = "";     // empty = keep scene.render.filepath directory
         public string OutputPrefix = "";  // empty = keep scene file name prefix
         public bool CustomOutput = false;
+        public bool CustomFrames = false; // render Frames instead of the scene range
+        public string Frames = "";        // "1-100, 120, 150-200"
         // Override: re-render every frame, overwriting existing files. Frames saved before OverrideSince
         // (unix seconds, set at the first Start) count as stale, so crashes / Stop / reboot resume the re-render.
         public bool Override = false;
@@ -121,6 +123,8 @@ namespace RenderCrashSolver
                         case "OutputPrefix": s.OutputPrefix = val; break;
                         case "CustomOutput":
                         case "OverrideOutput": /* name used up to 0.3 */ s.CustomOutput = val == "1"; break;
+                        case "CustomFrames": s.CustomFrames = val == "1"; break;
+                        case "Frames": s.Frames = val; break;
                         case "Override": s.Override = val == "1"; break;
                         case "OverrideSince": long since; if (long.TryParse(val, out since)) s.OverrideSince = since; break;
                         case "OverrideKey": s.OverrideKey = val; break;
@@ -153,6 +157,8 @@ namespace RenderCrashSolver
                     "OutputDir=" + OutputDir,
                     "OutputPrefix=" + OutputPrefix,
                     "CustomOutput=" + (CustomOutput ? "1" : "0"),
+                    "CustomFrames=" + (CustomFrames ? "1" : "0"),
+                    "Frames=" + Frames,
                     "Override=" + (Override ? "1" : "0"),
                     "OverrideSince=" + OverrideSince,
                     "OverrideKey=" + OverrideKey,
@@ -195,16 +201,19 @@ namespace RenderCrashSolver
         Settings settings;
 
         // the TextBoxes inside the Fields: the session code reads and writes them directly
-        TextBox txtBlender, txtBlend, txtOutputDir, txtOutputPrefix, txtLogDir;
+        TextBox txtBlender, txtBlend, txtOutputDir, txtOutputPrefix, txtFrames, txtLogDir;
         LogView txtLog;
-        Toggle chkCustomOutput, chkOverride;
-        Label lblScenePath, lblSceneMeta, lblEffectivePath, lblStatus, lblSubtitle, lblTelegram;
+        Toggle chkCustomOutput, chkCustomFrames, chkOverride;
+        Label lblScenePath, lblSceneMeta, lblEffectivePath, lblFramesInfo, lblStatus, lblSubtitle, lblTelegram;
         UiButton btnSceneRefresh;
         readonly List<Control> customOutputRows = new List<Control>(); // shown only with "Другая папка вывода"
+        readonly List<Control> customFramesRows = new List<Control>(); // shown only with "Свои кадры"
 
         // scene output settings read from the .blend via "resume_render.py -- --info"
         string sceneFilepath, sceneExt;
-        int sceneTotal, sceneDone;   // frame range size / frames already on disk, shown before the first Start
+        int sceneTotal, sceneDone;   // selected frames / of them already on disk, shown before the first Start
+        int sceneFrameStart, sceneFrameEnd = -1;
+        bool infoFramesSelected;     // the pending --info read was given --frames
         Process infoProc;
         int infoRequestId;
         DateTime sceneInfoDueAt = DateTime.MinValue;
@@ -446,6 +455,41 @@ namespace RenderCrashSolver
                 Font = Theme.Small, ForeColor = Theme.TextDim, Height = Theme.Small.Height + Theme.S(4), Margin = Theme.P(0, 0, 8, 4),
             };
             t.Controls.Add(lblSceneMeta, 1, row);
+
+            // frames: the scene range by default, or a list of frames / ranges typed by the animator
+            row = NextRow(t);
+            chkCustomFrames = new Toggle("Свои кадры", "Только выбранные кадры вместо диапазона сцены.")
+            {
+                Checked = settings.CustomFrames, Margin = Theme.P(0, 14, 0, 4),
+            };
+            t.Controls.Add(chkCustomFrames, 0, row);
+            t.SetColumnSpan(chkCustomFrames, 3);
+            settingsControls.Add(chkCustomFrames);
+            txtFrames = AddTextRow(t, "Кадры", settings.Frames, "например 1-100, 120, 150-200", customFramesRows);
+            tips.SetToolTip(txtFrames, "Номера и диапазоны через запятую или пробел.\nГотовые кадры не перерендериваются, как и в обычном режиме.");
+            row = NextRow(t);
+            lblFramesInfo = new Label
+            {
+                AutoSize = false, AutoEllipsis = true, UseMnemonic = false, Anchor = AnchorStyles.Left | AnchorStyles.Right,
+                Font = Theme.Small, ForeColor = Theme.TextDim, Height = Theme.Small.Height + Theme.S(4), Margin = Theme.P(0, 2, 0, 2),
+            };
+            t.Controls.Add(lblFramesInfo, 1, row);
+            t.SetColumnSpan(lblFramesInfo, 2);
+            customFramesRows.Add(lblFramesInfo);
+            chkCustomFrames.CheckedChanged += delegate
+            {
+                // start from the scene range so the animator edits what Blender would render
+                if (chkCustomFrames.Checked && txtFrames.Text.Trim().Length == 0 && sceneFrameEnd >= sceneFrameStart)
+                    txtFrames.Text = sceneFrameStart == sceneFrameEnd
+                        ? sceneFrameStart.ToString() : string.Format("{0}-{1}", sceneFrameStart, sceneFrameEnd);
+                UpdateFramesUi();
+                sceneInfoDueAt = DateTime.Now.AddMilliseconds(800); // "done N of M" for the new selection
+            };
+            txtFrames.TextChanged += delegate
+            {
+                UpdateFramesUi();
+                if (chkCustomFrames.Checked) sceneInfoDueAt = DateTime.Now.AddMilliseconds(1500);
+            };
 
             row = NextRow(t);
             chkCustomOutput = new Toggle("Другая папка вывода", "Своя папка или имя файла; сам .blend не меняется.")
@@ -736,6 +780,7 @@ namespace RenderCrashSolver
             btnStart.Enabled = !running;
             btnStop.Enabled = running;
             UpdateOutputUi();
+            UpdateFramesUi();
         }
 
         // ─── scene output path ───────────────────────────────────
@@ -782,6 +827,100 @@ namespace RenderCrashSolver
             catch { return null; } // invalid characters while typing
         }
 
+        // ─── custom frames ───────────────────────────────────────
+
+        const int MaxFrame = 1048574; // Blender's MAXFRAME
+        static readonly Regex FrameRangeRe = new Regex(@"^(\d+)(?:-(\d+))?$");
+
+        /// <summary>"1-100, 120 150-200" -> sorted, merged ranges; null and a readable error for anything else.</summary>
+        static List<KeyValuePair<int, int>> ParseFrames(string spec, out string error)
+        {
+            error = null;
+            var ranges = new List<KeyValuePair<int, int>>();
+            foreach (string part in Regex.Split(spec ?? "", @"[,;\s]+"))
+            {
+                if (part.Length == 0) continue;
+                Match m = FrameRangeRe.Match(part);
+                int first, last;
+                if (!m.Success || !int.TryParse(m.Groups[1].Value, out first) ||
+                    !int.TryParse(m.Groups[2].Success ? m.Groups[2].Value : m.Groups[1].Value, out last))
+                {
+                    error = "не понял «" + part + "»: пишите номера и диапазоны, например 1-100, 120";
+                    return null;
+                }
+                if (last < first || last > MaxFrame)
+                {
+                    error = "неверный диапазон «" + part + "»";
+                    return null;
+                }
+                ranges.Add(new KeyValuePair<int, int>(first, last));
+            }
+            if (ranges.Count == 0)
+            {
+                error = "укажите кадры, например 1-100, 120";
+                return null;
+            }
+            ranges.Sort((a, b) => a.Key.CompareTo(b.Key));
+            var merged = new List<KeyValuePair<int, int>>();
+            foreach (var r in ranges)
+            {
+                int n = merged.Count;
+                if (n > 0 && r.Key <= merged[n - 1].Value + 1)
+                    merged[n - 1] = new KeyValuePair<int, int>(merged[n - 1].Key, Math.Max(merged[n - 1].Value, r.Value));
+                else
+                    merged.Add(r);
+            }
+            return merged;
+        }
+
+        static string FramesText(List<KeyValuePair<int, int>> ranges, string dash, string separator)
+        {
+            var parts = new List<string>();
+            foreach (var r in ranges) parts.Add(r.Key == r.Value ? r.Key.ToString() : r.Key + dash + r.Value);
+            return string.Join(separator, parts.ToArray());
+        }
+
+        static int FrameCount(List<KeyValuePair<int, int>> ranges)
+        {
+            int n = 0;
+            foreach (var r in ranges) n += r.Value - r.Key + 1;
+            return n;
+        }
+
+        /// <summary>The "--frames" value for resume_render.py ("1-100,120"), null if the list is not valid.</summary>
+        static string NormalizeFrames(string spec)
+        {
+            string error;
+            List<KeyValuePair<int, int>> ranges = ParseFrames(spec, out error);
+            return ranges == null ? null : FramesText(ranges, "-", ",");
+        }
+
+        static string Plural(int n, string one, string few, string many)
+        {
+            int m10 = n % 10, m100 = n % 100;
+            if (m10 == 1 && m100 != 11) return one;
+            if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+            return many;
+        }
+
+        void UpdateFramesUi()
+        {
+            bool custom = chkCustomFrames.Checked;
+            foreach (Control c in customFramesRows) c.Visible = custom;
+            if (!custom) { lblFramesInfo.Text = ""; return; }
+            string error;
+            List<KeyValuePair<int, int>> ranges = ParseFrames(txtFrames.Text, out error);
+            if (ranges == null)
+            {
+                lblFramesInfo.Text = error;
+                lblFramesInfo.ForeColor = Theme.Orange;
+                return;
+            }
+            int count = FrameCount(ranges);
+            lblFramesInfo.Text = string.Format("{0} {1}: {2}", count, Plural(count, "кадр", "кадра", "кадров"), FramesText(ranges, "–", ", "));
+            lblFramesInfo.ForeColor = Theme.TextDim;
+        }
+
         void RefreshSceneInfo()
         {
             sceneInfoDueAt = DateTime.MinValue;
@@ -803,8 +942,12 @@ namespace RenderCrashSolver
 
             int id = ++infoRequestId;
             SetSceneText(lblScenePath.Text, "читаю сцену в Blender…", Theme.TextDim);
+            // with "Свои кадры" the status ("done N of M") counts the selected frames
+            string frames = chkCustomFrames.Checked ? NormalizeFrames(txtFrames.Text) : null;
+            infoFramesSelected = frames != null;
             var psi = new ProcessStartInfo(blender,
-                string.Format("-b \"{0}\" --python-exit-code {1} -P \"{2}\" -- --info", blend, ScriptErrorExitCode, ScriptPath))
+                string.Format("-b \"{0}\" --python-exit-code {1} -P \"{2}\" -- --info{3}", blend, ScriptErrorExitCode, ScriptPath,
+                    frames != null ? " --frames \"" + frames + "\"" : ""))
             {
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -871,8 +1014,13 @@ namespace RenderCrashSolver
                     else if (msg.StartsWith("SCENE_EXT ")) ext = msg.Substring(10).Trim();
                     else if (msg.StartsWith("SCENE_FRAMES "))
                     {
+                        // SCENE_FRAMES <start> <end> [<step>] (the step was added in 0.5)
                         string[] parts = msg.Split(' ');
-                        if (parts.Length >= 3) frames = string.Format("кадры {0}–{1}", parts[1], parts[2]);
+                        if (parts.Length >= 3 && int.TryParse(parts[1], out sceneFrameStart) && int.TryParse(parts[2], out sceneFrameEnd))
+                        {
+                            frames = string.Format(infoFramesSelected ? "сцена {0}–{1}" : "кадры {0}–{1}", sceneFrameStart, sceneFrameEnd);
+                            if (parts.Length >= 4 && parts[3] != "1") frames += ", шаг " + parts[3];
+                        }
                     }
                     else if (msg.StartsWith("STATUS "))
                     {
@@ -881,7 +1029,7 @@ namespace RenderCrashSolver
                         {
                             rangeTotal = int.Parse(m.Groups[1].Value);
                             rangeDone = int.Parse(m.Groups[2].Value);
-                            status = string.Format("готово {0} из {1}", rangeDone, rangeTotal);
+                            status = string.Format(infoFramesSelected ? "готово {0} из {1} выбранных" : "готово {0} из {1}", rangeDone, rangeTotal);
                         }
                     }
                 }
@@ -891,6 +1039,7 @@ namespace RenderCrashSolver
             {
                 sceneFilepath = null;
                 sceneTotal = sceneDone = 0;
+                sceneFrameEnd = -1;
                 SetSceneText("—", "Не удалось прочитать сцену (подробности — в журнале при запуске рендера)", Theme.Orange);
                 UpdateOutputUi();
                 return;
@@ -926,6 +1075,8 @@ namespace RenderCrashSolver
             settings.OutputDir = txtOutputDir.Text.Trim().Trim('"').TrimEnd('\\', '/');
             settings.OutputPrefix = txtOutputPrefix.Text.Trim();
             settings.CustomOutput = chkCustomOutput.Checked;
+            settings.CustomFrames = chkCustomFrames.Checked;
+            settings.Frames = txtFrames.Text.Trim();
             settings.Override = chkOverride.Checked;
             settings.LogDir = txtLogDir.Text.Trim().Trim('"');
             settings.MaxRetries = numRetries.Value;
@@ -937,7 +1088,8 @@ namespace RenderCrashSolver
         {
             ReadSettingsFromUi();
 
-            string error = null;
+            string error = null, framesError = null;
+            List<KeyValuePair<int, int>> frameRanges = settings.CustomFrames ? ParseFrames(settings.Frames, out framesError) : null;
             if (!File.Exists(settings.BlenderExe)) error = "Не найден blender.exe:\n" + settings.BlenderExe;
             else if (!File.Exists(settings.BlendFile)) error = "Не найден .blend файл:\n" + settings.BlendFile;
             else if (!File.Exists(ScriptPath))
@@ -947,6 +1099,8 @@ namespace RenderCrashSolver
                 error = "Папка вывода должна быть полным путём, например E:\\Render\\shot01";
             else if (settings.CustomOutput && (settings.OutputPrefix.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || settings.OutputPrefix.Contains("\"")))
                 error = "Имя файла содержит недопустимые символы: " + settings.OutputPrefix;
+            else if (framesError != null)
+                error = "Свои кадры: " + framesError;
             else
             {
                 try { Directory.CreateDirectory(settings.LogDir); }
@@ -973,7 +1127,7 @@ namespace RenderCrashSolver
                 else
                 {
                     var answer = MessageBox.Show(this,
-                        "Override: все кадры будут отрендерены заново.\n\n" +
+                        (settings.CustomFrames ? "Override: выбранные кадры будут отрендерены заново.\n\n" : "Override: все кадры будут отрендерены заново.\n\n") +
                         "Уже существующие файлы кадров в папке вывода будут перезаписаны по мере рендера. " +
                         "Если рендер прервётся или вы его остановите, при следующем старте он продолжится с места остановки, " +
                         "а ещё не перезаписанные старые кадры останутся на месте.\n\nНачать?",
@@ -1003,6 +1157,11 @@ namespace RenderCrashSolver
             }
             if (txtLog.TextLength > 0) AddUi("");
             AddUi("Старт: " + Path.GetFileName(settings.BlendFile), LogKind.Section);
+            if (frameRanges != null)
+            {
+                int count = FrameCount(frameRanges);
+                AddUi(string.Format("Свои кадры: {0} ({1} {2})", FramesText(frameRanges, "–", ", "), count, Plural(count, "кадр", "кадра", "кадров")));
+            }
             if (settings.CustomOutput)
                 AddUi(string.Format("Другая папка вывода: папка = {0}, имя = {1}",
                     settings.OutputDir.Length > 0 ? settings.OutputDir : "(из сцены)",
@@ -1049,6 +1208,8 @@ namespace RenderCrashSolver
             if (settings.CustomOutput && settings.OutputDir.Length > 0) args.AppendFormat(" --output-dir \"{0}\"", settings.OutputDir);
             if (settings.CustomOutput && settings.OutputPrefix.Length > 0) args.AppendFormat(" --prefix \"{0}\"", settings.OutputPrefix);
             if (settings.Override && settings.OverrideSince > 0) args.AppendFormat(" --override-since {0}", settings.OverrideSince);
+            string frames = settings.CustomFrames ? NormalizeFrames(settings.Frames) : null; // validated in StartSession
+            if (frames != null) args.AppendFormat(" --frames \"{0}\"", frames);
 
             var psi = new ProcessStartInfo(settings.BlenderExe, args.ToString())
             {
@@ -1507,6 +1668,12 @@ namespace RenderCrashSolver
 
             string blend = attempt > 0 ? settings.BlendFile : txtBlend.Text.Trim().Trim('"');
             string subtitle = blend.Length == 0 ? "Укажите Blender и сцену .blend, затем нажмите «Старт»" : Path.GetFileName(blend);
+            if (blend.Length > 0 && chkCustomFrames.Checked)
+            {
+                string framesError;
+                List<KeyValuePair<int, int>> ranges = ParseFrames(txtFrames.Text, out framesError);
+                if (ranges != null) subtitle += "   ·   кадры " + FramesText(ranges, "–", ", ");
+            }
             if (blend.Length > 0 && dir == null && sceneFilepath != null)
             {
                 string effective = EffectiveOutputPath();
