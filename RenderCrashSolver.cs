@@ -176,7 +176,7 @@ namespace RenderCrashSolver
 
     class MainForm : Form
     {
-        const string AppTitle = "RenderCrashSolver 0.4";
+        const string AppTitle = "RenderCrashSolver 0.5";
 #if TELEGRAM
         static readonly bool TelegramFeature = true;
 #else
