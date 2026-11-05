@@ -51,16 +51,23 @@ namespace RenderSolver
         public long OverrideSince = 0;
         public string OverrideKey = "";      // blend + output the OverrideSince belongs to
 
+        // read from the .blend with "resume_render.py -- --info" and kept in settings.ini, so Blender (and the
+        // scene's RAM) is needed again only when the .blend changes; SceneStamp = size:write time it was read from
+        public string SceneStamp = "";
+        public string SceneFilepath, SceneExt;
+        public int SceneStart, SceneEnd = -1, SceneStep = 1;
+        // remembered from the scene's last render, for the finish time of the queue
+        public double AvgFrameSec, LoadSec;
+
         // this run of the program only
         public JobStatus Status = JobStatus.Waiting;
         public string Message = "";
-        // read from the .blend with "resume_render.py -- --info"; InfoValid = false means (re)read it
-        public bool InfoValid;
+        public bool InfoValid;               // false = check the cached scene info, read the .blend if it changed
         public string InfoError;             // why the scene could not be read
-        public string SceneFilepath, SceneExt;
-        public int SceneStart, SceneEnd = -1, SceneStep = 1;
-        public int Total, Done;              // selected frames / of them already on disk
+        public int Total, Done;              // selected frames / of them complete on disk, counted by the program
         public bool InfoFramesSelected;      // Total and Done count the custom frames
+        public DateTime RecountAt = DateTime.MinValue; // count the frames on disk again at this time
+        public bool Counting;
 
         public string Name
         {
@@ -70,8 +77,24 @@ namespace RenderSolver
         public bool ReadKey(string key, string val)
         {
             long since;
+            int a, b, c;
+            double sec;
             switch (key)
             {
+                case "AvgFrameSec": if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out sec)) AvgFrameSec = sec; return true;
+                case "LoadSec": if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out sec)) LoadSec = sec; return true;
+                case "SceneStamp": SceneStamp = val; return true;
+                case "ScenePath": SceneFilepath = val.Length > 0 ? val : null; return true;
+                case "SceneExt": SceneExt = val.Length > 0 && val != "FFMPEG" ? val : null; return true;
+                case "SceneRange":
+                    string[] parts = val.Split(' ');
+                    if (parts.Length == 3 && int.TryParse(parts[0], out a) && int.TryParse(parts[1], out b) && int.TryParse(parts[2], out c))
+                    {
+                        SceneStart = a;
+                        SceneEnd = b;
+                        SceneStep = Math.Max(1, c);
+                    }
+                    return true;
                 case "BlendFile": BlendFile = val; return true;
                 case "Enabled": Enabled = val != "0"; return true;
                 case "CustomFrames": CustomFrames = val == "1"; return true;
@@ -87,9 +110,9 @@ namespace RenderSolver
             return false;
         }
 
-        public string[] SaveLines()
+        public List<string> SaveLines()
         {
-            return new[]
+            var lines = new List<string>
             {
                 "[job]",
                 "BlendFile=" + BlendFile,
@@ -103,6 +126,16 @@ namespace RenderSolver
                 "OverrideSince=" + OverrideSince,
                 "OverrideKey=" + OverrideKey,
             };
+            if (SceneFilepath != null && SceneStamp.Length > 0)
+            {
+                lines.Add("SceneStamp=" + SceneStamp);
+                lines.Add("ScenePath=" + SceneFilepath);
+                lines.Add("SceneExt=" + (SceneExt ?? "FFMPEG"));
+                lines.Add(string.Format("SceneRange={0} {1} {2}", SceneStart, SceneEnd, SceneStep));
+            }
+            if (AvgFrameSec > 0) lines.Add("AvgFrameSec=" + AvgFrameSec.ToString("0.##", CultureInfo.InvariantCulture));
+            if (LoadSec > 0) lines.Add("LoadSec=" + LoadSec.ToString("0.#", CultureInfo.InvariantCulture));
+            return lines;
         }
 
         /// <summary>Same scene and options; a pending Override re-render is not copied.</summary>
@@ -112,7 +145,21 @@ namespace RenderSolver
             {
                 BlendFile = BlendFile, Enabled = Enabled, CustomFrames = CustomFrames, Frames = Frames,
                 CustomOutput = CustomOutput, OutputDir = OutputDir, OutputPrefix = OutputPrefix, Override = Override,
+                SceneStamp = SceneStamp, SceneFilepath = SceneFilepath, SceneExt = SceneExt,
+                SceneStart = SceneStart, SceneEnd = SceneEnd, SceneStep = SceneStep,
+                AvgFrameSec = AvgFrameSec, LoadSec = LoadSec,
             };
+        }
+
+        /// <summary>Size and write time of the .blend ("" if missing): the cached scene info holds while it stays the same.</summary>
+        public static string FileStamp(string path)
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                return fi.Exists ? fi.Length + ":" + fi.LastWriteTimeUtc.Ticks : "";
+            }
+            catch { return ""; }
         }
     }
 
@@ -325,6 +372,9 @@ namespace RenderSolver
         StreamWriter logWriter;
         int total, done, currentFrame;
         DateTime lastProgress;
+        DateTime launchAt;     // Blender started; the first FRAME_START after it gives the scene's load time
+        double loadSec;
+        bool loadMeasured;
         bool allDoneSeen;
         string outputDir;
         // preview updates produced by the reader threads, applied on the UI thread
@@ -478,7 +528,10 @@ namespace RenderSolver
             for (int i = 0; i < 5; i++) tiles.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20));
             tiles.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             tileFrames = AddTile(tiles, 0, "Кадры", "Во время рендера — текущая сцена, до старта — все отмеченные сцены");
-            tileEta = AddTile(tiles, 1, "Осталось", "Текущая сцена: среднее время кадра × оставшиеся кадры");
+            tileEta = AddTile(tiles, 1, "Осталось",
+                "Оценка до конца очереди: оставшиеся кадры × среднее время кадра + загрузка сцены.\n" +
+                "Время кадра — текущего рендера или прошлого рендера сцены; у новых сцен — как у остальных.\n" +
+                "«≥» — для части сцен данных ещё нет, их время не учтено.");
             tileAvg = AddTile(tiles, 2, "Среднее время кадра", "По последним 20 кадрам");
             tileQueue = AddTile(tiles, 3, "Очередь", null);
             tileAttempts = AddTile(tiles, 4, "Попытка", "Запуски Blender для текущей сцены");
@@ -651,8 +704,13 @@ namespace RenderSolver
             lblScenePath.Click += delegate { if (selected != null && selected.SceneFilepath != null) OpenFolder(Path.GetDirectoryName(selected.SceneFilepath)); };
             t.Controls.Add(lblScenePath, 1, row);
             btnSceneRefresh = new UiButton("", Glyph.Refresh, ButtonKind.Ghost) { Anchor = AnchorStyles.Top, Margin = Theme.P(0, 3, 0, 3), AccessibleName = "Перечитать сцену" };
-            btnSceneRefresh.Click += delegate { if (selected != null) MarkInfoDirty(selected, 0); };
-            tips.SetToolTip(btnSceneRefresh, "Перечитать путь вывода и готовые кадры из .blend");
+            btnSceneRefresh.Click += delegate
+            {
+                if (selected == null) return;
+                selected.SceneStamp = ""; // read the .blend in Blender even if it has not changed
+                MarkInfoDirty(selected, 0);
+            };
+            tips.SetToolTip(btnSceneRefresh, "Перечитать сцену в Blender: путь вывода, кадры, формат.\nОбычно не нужно: сцена перечитывается сама, когда .blend сохранён заново.");
             t.Controls.Add(btnSceneRefresh, 2, row);
             t.SetRowSpan(btnSceneRefresh, 2);
             editorControls.Add(btnSceneRefresh);
@@ -713,7 +771,10 @@ namespace RenderSolver
             {
                 if (!Editing) return;
                 selected.BlendFile = txtBlend.Text.Trim().Trim('"');
-                JobEdited(800);
+                selected.SceneStamp = ""; // another file: its cached scene info does not apply
+                selected.SceneFilepath = null;
+                MarkInfoDirty(selected, 800);
+                JobEdited(-1);
             };
             chkCustomFrames.CheckedChanged += delegate
             {
@@ -724,7 +785,7 @@ namespace RenderSolver
                         txtFrames.Text = selected.SceneStart == selected.SceneEnd
                             ? selected.SceneStart.ToString() : string.Format("{0}-{1}", selected.SceneStart, selected.SceneEnd);
                     selected.CustomFrames = chkCustomFrames.Checked;
-                    JobEdited(800);
+                    JobEdited(300);
                 }
                 UpdateFramesUi();
             };
@@ -733,7 +794,7 @@ namespace RenderSolver
                 if (Editing)
                 {
                     selected.Frames = txtFrames.Text.Trim();
-                    if (selected.CustomFrames) JobEdited(1500);
+                    if (selected.CustomFrames) JobEdited(800);
                 }
                 UpdateFramesUi();
             };
@@ -748,7 +809,7 @@ namespace RenderSolver
                         txtOutputPrefix.Text = Path.GetFileName(selected.SceneFilepath);
                     }
                     selected.CustomOutput = chkCustomOutput.Checked;
-                    JobEdited(800);
+                    JobEdited(300);
                 }
                 UpdateOutputUi();
             };
@@ -757,7 +818,7 @@ namespace RenderSolver
                 if (Editing)
                 {
                     selected.OutputDir = txtOutputDir.Text.Trim().Trim('"');
-                    if (selected.CustomOutput) JobEdited(1500);
+                    if (selected.CustomOutput) JobEdited(800);
                 }
                 UpdateOutputUi();
             };
@@ -766,7 +827,7 @@ namespace RenderSolver
                 if (Editing)
                 {
                     selected.OutputPrefix = txtOutputPrefix.Text.Trim();
-                    if (selected.CustomOutput) JobEdited(1500);
+                    if (selected.CustomOutput) JobEdited(800);
                 }
                 UpdateOutputUi();
             };
@@ -777,7 +838,7 @@ namespace RenderSolver
                     selected.Override = chkOverride.Checked;
                     // unticking cancels a re-render in progress: from then on existing frames count as done again
                     if (!chkOverride.Checked) { selected.OverrideSince = 0; selected.OverrideKey = ""; }
-                    JobEdited(-1);
+                    JobEdited(0);
                 }
                 UpdateOverrideText();
             };
@@ -802,6 +863,7 @@ namespace RenderSolver
             txtBlender.TextChanged += delegate
             {
                 settings.BlenderExe = txtBlender.Text.Trim().Trim('"');
+                // scenes read before stay cached; the others (e.g. "укажите blender.exe") are tried again
                 foreach (Job job in jobs) job.InfoValid = false;
                 CancelSceneInfo();
                 infoDueAt = DateTime.Now.AddMilliseconds(800);
@@ -1063,12 +1125,12 @@ namespace RenderSolver
             get { return !loadingEditor && selected != null; }
         }
 
-        /// <summary>The selected job's options changed: re-read the scene after infoDelayMs (negative = no re-read).</summary>
-        void JobEdited(int infoDelayMs)
+        /// <summary>The selected job's options changed: count its frames on disk again after recountDelayMs (negative = no recount).</summary>
+        void JobEdited(int recountDelayMs)
         {
             // an edited scene that already finished in this run renders again if the queue is still running
             if (selected.Status != JobStatus.Rendering) { selected.Status = JobStatus.Waiting; selected.Message = ""; }
-            if (infoDelayMs >= 0) MarkInfoDirty(selected, infoDelayMs);
+            if (recountDelayMs >= 0) selected.RecountAt = DateTime.Now.AddMilliseconds(recountDelayMs);
             UpdateJobTitle();
             queueList.Invalidate();
         }
@@ -1206,6 +1268,8 @@ namespace RenderSolver
                 v.Progress = t > 0 ? (float)d / t : 0;
                 v.Chip = t > 0 ? (int)(100L * d / t) + "%" : "РЕНДЕР";
                 v.ChipColor = state == RunState.Waiting ? Theme.Orange : Theme.AccentText;
+                double left = JobSecondsLeft(j);
+                if (left > 0) v.Detail += " · ≈ " + FormatDuration(left);
                 return v;
             }
 
@@ -1217,6 +1281,9 @@ namespace RenderSolver
                 string frames = FramesSummary(j);
                 v.Detail = frames + (j.Total > 0 ? string.Format("{0}готово {1} из {2}", frames.Length > 0 ? " · " : "", j.Done, j.Total) : "");
                 if (j.Total > 0) v.Progress = (float)j.Done / j.Total;
+                // time this scene still needs, from its last render (or the others') — not for scenes already handled in this run
+                double left = j.Enabled && (j.Status == JobStatus.Waiting || !queueRunning) ? JobSecondsLeft(j) : -1;
+                if (left > 0) v.Detail += " · ≈ " + FormatDuration(left);
             }
             else v.Detail = "сцена ещё не прочитана";
 
@@ -1447,7 +1514,11 @@ namespace RenderSolver
             infoJob = null;
         }
 
-        /// <summary>Starts reading the next scene that needs it; called from the timer while the queue is idle.</summary>
+        /// <summary>
+        /// Brings the next scene that needs it up to date; called from the timer while the queue is idle.
+        /// A .blend that has not changed since it was read is not loaded again: Blender would hold the whole
+        /// scene in RAM just to report its output path, e.g. right after Stop.
+        /// </summary>
         void PumpSceneInfo()
         {
             if (infoProc != null || DateTime.Now < infoDueAt) return;
@@ -1455,36 +1526,54 @@ namespace RenderSolver
             foreach (Job j in jobs)
             {
                 if (j.InfoValid) continue;
-                string problem = !File.Exists(settings.BlenderExe) ? "укажите blender.exe на вкладке «Настройки»"
-                    : j.BlendFile.Length == 0 ? "выберите файл сцены .blend"
-                    : !File.Exists(j.BlendFile) ? "файл сцены не найден"
-                    : !File.Exists(ScriptPath) ? "рядом с программой нет resume_render.py" : null;
+                changed = true;
+                string problem = j.BlendFile.Length == 0 ? "выберите файл сцены .blend"
+                    : !File.Exists(j.BlendFile) ? "файл сцены не найден" : null;
+                if (problem == null && j.SceneFilepath != null && j.SceneStamp.Length > 0 && Job.FileStamp(j.BlendFile) == j.SceneStamp)
+                {
+                    j.InfoValid = true;
+                    j.InfoError = null;
+                    j.RecountAt = DateTime.Now;
+                    continue;
+                }
+                if (problem == null)
+                    problem = !File.Exists(settings.BlenderExe) ? "укажите blender.exe на вкладке «Настройки»"
+                        : !File.Exists(ScriptPath) ? "рядом с программой нет resume_render.py" : null;
                 if (problem != null)
                 {
                     j.InfoValid = true;
                     j.InfoError = problem;
                     j.SceneFilepath = null;
+                    j.SceneStamp = "";
                     j.Total = j.Done = 0;
                     j.SceneEnd = -1;
-                    changed = true;
                     continue;
                 }
                 StartSceneInfo(j);
-                changed = true;
                 break;
             }
             if (changed) RefreshJobViews();
         }
 
+        /// <summary>A .blend saved again since it was read gets read again (its range or output may have changed).</summary>
+        void CheckSceneStamps()
+        {
+            foreach (Job j in jobs)
+            {
+                if (!j.InfoValid || j == infoJob || j.SceneStamp.Length == 0 || Job.FileStamp(j.BlendFile) == j.SceneStamp) continue;
+                j.InfoValid = false;
+                infoDueAt = DateTime.Now;
+            }
+        }
+
         void StartSceneInfo(Job j)
         {
             int id = ++infoRequestId;
-            // with "Свои кадры" the status ("done N of M") counts the selected frames
-            string frames = j.CustomFrames ? NormalizeFrames(j.Frames) : null;
-            bool framesSelected = frames != null;
+            string stamp = Job.FileStamp(j.BlendFile);
+            // --factory-startup: the output path, range and format do not depend on add-ons, and loading them
+            // (BlenderKit, Rokoko...) made this read take ~16 s; the render itself keeps the add-ons
             var psi = new ProcessStartInfo(settings.BlenderExe,
-                string.Format("-b \"{0}\" --python-exit-code {1} -P \"{2}\" -- --info{3}{4}", j.BlendFile, ScriptErrorExitCode, ScriptPath,
-                    frames != null ? " --frames \"" + frames + "\"" : "", OutputArgs(j)))
+                string.Format("-b --factory-startup \"{0}\" --python-exit-code {1} -P \"{2}\" -- --info", j.BlendFile, ScriptErrorExitCode, ScriptPath))
             {
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -1509,7 +1598,7 @@ namespace RenderSolver
             p.Exited += (s, e) =>
             {
                 p.WaitForExit();
-                try { if (!IsDisposed) BeginInvoke(new Action(() => ApplySceneInfo(j, id, p, lines, framesSelected))); } catch { }
+                try { if (!IsDisposed) BeginInvoke(new Action(() => ApplySceneInfo(j, id, p, lines, stamp))); } catch { }
             };
             try
             {
@@ -1527,14 +1616,14 @@ namespace RenderSolver
             }
         }
 
-        void ApplySceneInfo(Job j, int id, Process p, List<string> lines, bool framesSelected)
+        void ApplySceneInfo(Job j, int id, Process p, List<string> lines, string stamp)
         {
             if (infoProc == p) { infoProc = null; infoJob = null; }
             p.Dispose();
             if (id != infoRequestId) return; // cancelled or superseded
 
             string path = null, ext = null;
-            int start = 0, end = -1, step = 1, rangeTotal = 0, rangeDone = 0;
+            int start = 0, end = -1, step = 1;
             lock (lines)
             {
                 foreach (string msg in lines)
@@ -1548,30 +1637,170 @@ namespace RenderSolver
                         if (parts.Length >= 3 && int.TryParse(parts[1], out start) && int.TryParse(parts[2], out end))
                             if (parts.Length < 4 || !int.TryParse(parts[3], out step)) step = 1;
                     }
-                    else if (msg.StartsWith("STATUS "))
-                    {
-                        Match m = StatusRe.Match(msg);
-                        if (m.Success)
-                        {
-                            rangeTotal = int.Parse(m.Groups[1].Value);
-                            rangeDone = int.Parse(m.Groups[2].Value);
-                        }
-                    }
                 }
             }
 
             j.InfoValid = true;
             j.SceneFilepath = path;
+            j.SceneStamp = path != null ? stamp : "";
             j.InfoError = path == null ? "не удалось прочитать сцену (подробности — в журнале при запуске рендера)" : null;
             j.SceneExt = ext == "FFMPEG" ? null : ext;
             j.SceneStart = start;
             j.SceneEnd = path != null ? end : -1;
             j.SceneStep = Math.Max(1, step);
-            j.Total = rangeTotal;
-            j.Done = rangeDone;
-            j.InfoFramesSelected = framesSelected;
-            infoDueAt = DateTime.Now; // go on with the next scene
+            j.Total = j.Done = 0;
+            j.RecountAt = DateTime.Now; // the frames on disk are counted by the program, not by Blender
+            settings.Save();             // keeps the scene info for the next start of the program
+            infoDueAt = DateTime.Now;    // go on with the next scene
             RefreshJobViews();
+        }
+
+        // ─── frames on disk ──────────────────────────────────────
+
+        struct DiskCount
+        {
+            public int Total, Done;
+            public bool Selected;   // counted the custom frames
+        }
+
+        /// <summary>What CountOnDisk needs, taken from the job on the UI thread.</summary>
+        class CountInput
+        {
+            public string PathNoExt, Ext;
+            public List<KeyValuePair<int, int>> Ranges;   // custom frames, null = scene range
+            public int Start, End, Step;
+            public long StaleBefore;                      // Override: files older than this do not count
+        }
+
+        static CountInput CountInputOf(Job j)
+        {
+            string path = EffectiveOutputPath(j);
+            if (path == null || j.SceneExt == null) return null;
+            string error;
+            return new CountInput
+            {
+                PathNoExt = path,
+                Ext = j.SceneExt,
+                Ranges = j.CustomFrames ? ParseFrames(j.Frames, out error) : null,
+                Start = j.SceneStart,
+                End = j.SceneEnd,
+                Step = Math.Max(1, j.SceneStep),
+                StaleBefore = j.Override ? j.OverrideSince : 0,
+            };
+        }
+
+        /// <summary>Selected frames and how many of them are complete on disk, judged like resume_render.py does.</summary>
+        static DiskCount CountOnDisk(CountInput input)
+        {
+            var count = new DiskCount();
+            if (input == null) return count;
+            HashSet<int> onDisk = FramesOnDisk(input.PathNoExt, input.Ext, input.StaleBefore);
+            count.Selected = input.Ranges != null;
+            if (input.Ranges != null)
+            {
+                foreach (var r in input.Ranges)
+                    for (int f = r.Key; f <= r.Value; f++) { count.Total++; if (onDisk.Contains(f)) count.Done++; }
+            }
+            else
+            {
+                for (int f = input.Start; f <= input.End; f += input.Step) { count.Total++; if (onDisk.Contains(f)) count.Done++; }
+            }
+            return count;
+        }
+
+        // frame numbers of "<dir>\<prefix>####<suffix>.<ext>" files that are complete
+        static HashSet<int> FramesOnDisk(string pathNoExt, string ext, long staleBefore)
+        {
+            var frames = new HashSet<int>();
+            try
+            {
+                string dir = Path.GetDirectoryName(pathNoExt), name = Path.GetFileName(pathNoExt);
+                if (!Directory.Exists(dir)) return frames;
+                string prefix = name, suffix = "";
+                if (name.Contains("#"))
+                {
+                    prefix = name.Substring(0, name.IndexOf('#'));
+                    suffix = name.Substring(name.LastIndexOf('#') + 1);
+                }
+                var pattern = new Regex("^" + Regex.Escape(prefix) + @"(\d+)" + Regex.Escape(suffix) + @"\." + Regex.Escape(ext) + "$",
+                    RegexOptions.IgnoreCase);
+                DateTime stale = UnixEpoch.AddSeconds(staleBefore);
+                foreach (string file in Directory.GetFiles(dir, "*." + ext))
+                {
+                    Match m = pattern.Match(Path.GetFileName(file));
+                    int n;
+                    if (!m.Success || !int.TryParse(m.Groups[1].Value, out n)) continue;
+                    if (staleBefore > 0 && File.GetLastWriteTimeUtc(file) < stale) continue;
+                    if (IsComplete(file, ext)) frames.Add(n);
+                }
+            }
+            catch { }
+            return frames;
+        }
+
+        // false for empty files and JPG/PNG files cut off mid-write (the same check as resume_render.py)
+        static bool IsComplete(string file, string ext)
+        {
+            try
+            {
+                using (var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    long size = fs.Length;
+                    if (size == 0) return false;
+                    string e = ext.ToLowerInvariant();
+                    if (e != "jpg" && e != "jpeg" && e != "png") return true;
+                    var tail = new byte[(int)Math.Min(32, size)];
+                    fs.Seek(size - tail.Length, SeekOrigin.Begin);
+                    int read = 0, r;
+                    while (read < tail.Length && (r = fs.Read(tail, read, tail.Length - read)) > 0) read += r;
+                    for (int i = 0; i + 1 < read; i++)
+                    {
+                        if (e == "png" && i + 3 < read && tail[i] == 'I' && tail[i + 1] == 'E' && tail[i + 2] == 'N' && tail[i + 3] == 'D') return true;
+                        if (e != "png" && tail[i] == 0xFF && tail[i + 1] == 0xD9) return true;
+                    }
+                    return false;
+                }
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Starts the due frame counts on the thread pool (big sequences on a network drive take a while).</summary>
+        void PumpCounts()
+        {
+            foreach (Job j in jobs)
+                if (j.RecountAt != DateTime.MinValue && DateTime.Now >= j.RecountAt && !j.Counting && j.InfoValid && !(queueRunning && j == current))
+                    StartCount(j);
+        }
+
+        void StartCount(Job j)
+        {
+            j.RecountAt = DateTime.MinValue;
+            CountInput input = CountInputOf(j);
+            if (input == null)
+            {
+                j.Total = j.Done = 0;
+                RefreshJobViews();
+                return;
+            }
+            j.Counting = true;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                DiskCount c = CountOnDisk(input);
+                try
+                {
+                    if (!IsDisposed) BeginInvoke(new Action(() =>
+                    {
+                        j.Counting = false;
+                        // edited again meanwhile (another count is due), or rendering now (Blender reports its numbers)
+                        if (j.RecountAt != DateTime.MinValue || (queueRunning && j == current)) return;
+                        j.Total = c.Total;
+                        j.Done = c.Done;
+                        j.InfoFramesSelected = c.Selected;
+                        RefreshJobViews();
+                    }));
+                }
+                catch { }
+            });
         }
 
         // path line of the editor; the line under it carries frames / status / problems
@@ -1735,8 +1964,17 @@ namespace RenderSolver
                 FinishJob(JobStatus.Failed, problem);
                 return;
             }
-            // already complete according to the last scene read: no need to load it in Blender
-            if (!next.Override && next.InfoValid && next.SceneFilepath != null && next.Total > 0 && next.Done >= next.Total)
+            // all frames on disk (fresh count, scene unchanged since it was read): no need to load it in Blender
+            bool complete = false;
+            if (!next.Override && next.SceneFilepath != null && next.SceneStamp.Length > 0 && Job.FileStamp(next.BlendFile) == next.SceneStamp)
+            {
+                DiskCount c = CountOnDisk(CountInputOf(next));
+                next.Total = c.Total;
+                next.Done = c.Done;
+                next.InfoFramesSelected = c.Selected;
+                complete = c.Total > 0 && c.Done >= c.Total;
+            }
+            if (complete)
             {
                 next.Status = JobStatus.Done;
                 next.Message = "все кадры уже на диске";
@@ -1804,7 +2042,8 @@ namespace RenderSolver
             {
                 allDoneSeen = false;
                 currentFrame = 0;
-                lastProgress = DateTime.Now;
+                lastProgress = launchAt = DateTime.Now;
+                loadMeasured = false;
                 try
                 {
                     logWriter = new StreamWriter(logPath, true, new UTF8Encoding(false));
@@ -1944,12 +2183,13 @@ namespace RenderSolver
                 if (selected == j) { loadingEditor = true; chkOverride.Checked = false; loadingEditor = false; UpdateOverrideText(); }
                 AddUi(j.Name + ": Override завершён, все кадры отрендерены заново, галочка снята.", LogKind.Success);
             }
-            // the row shows what this render reached until the scene is re-read once the queue is idle
+            // the row shows what this render reached; the frames on disk are counted again right after
+            // (by the program: loading the scene in Blender for that would take its RAM again)
             lock (sync)
             {
                 if (total > 0) { j.Total = total; j.Done = status == JobStatus.Done ? total : done; }
             }
-            j.InfoValid = false;
+            j.RecountAt = DateTime.Now.AddSeconds(1);
             settings.Save();
 
             if (status == JobStatus.Done && settings.TgOnDone) NotifyTelegram("✅ Сцена готова", true, j);
@@ -2158,6 +2398,11 @@ namespace RenderSolver
             {
                 int.TryParse(msg.Substring(12).Trim(), out currentFrame);
                 lastProgress = DateTime.Now;
+                if (!loadMeasured)
+                {
+                    loadSec = (lastProgress - launchAt).TotalSeconds;
+                    loadMeasured = true;
+                }
                 return;
             }
             if (msg.StartsWith("FRAME_DONE "))
@@ -2255,7 +2500,7 @@ namespace RenderSolver
 
         // ─── periodic update ─────────────────────────────────────
 
-        int flushCounter;
+        int flushCounter, stampCounter;
 
         void OnTick()
         {
@@ -2276,8 +2521,14 @@ namespace RenderSolver
 
             if (state == RunState.Waiting && queueRunning && DateTime.Now >= retryAt) Launch();
 
-            // scenes are read only while idle, so a read never competes with the render for RAM
-            if (!queueRunning) PumpSceneInfo();
+            // scenes are read only while idle, so a read never competes with the render for RAM;
+            // counting frames on disk needs no Blender and goes on during the render
+            PumpCounts();
+            if (!queueRunning)
+            {
+                if (++stampCounter >= 10) { stampCounter = 0; CheckSceneStamps(); }
+                PumpSceneInfo();
+            }
 
             if (++flushCounter >= 10)
             {
@@ -2308,11 +2559,19 @@ namespace RenderSolver
                     double sum = 0;
                     for (int i = durations.Count - n; i < durations.Count; i++) sum += durations[i];
                     avg = sum / n;
+                    double all = 0;
+                    foreach (double x in durations) all += x;
+                    // remembered for the next estimates of this scene (saved with the queue)
+                    if (queueRunning && current != null) current.AvgFrameSec = all / durations.Count;
                 }
+                if (queueRunning && current != null && loadMeasured) current.LoadSec = loadSec;
                 hasOutput = !string.IsNullOrEmpty(outputDir);
                 if (hasOutput) dir = outputDir;
             }
             bool active = state == RunState.Rendering || state == RunState.Waiting;
+            liveFrameSec = active ? avg : 0;
+            bool allKnown, othersLeft;
+            double queueLeft = QueueSecondsLeft(out allKnown, out othersLeft);
             int enabled = 0, finished = 0, failed = 0, position, count;
             foreach (Job j in jobs)
             {
@@ -2379,11 +2638,21 @@ namespace RenderSolver
 
             tileFrames.Set(t > 0 ? string.Format("{0} / {1}", d, t) : "—",
                 t > 0 ? string.Format("{0}% · осталось {1}", pct, t - d) : "", Theme.Text);
-            if (active && avg > 0 && t > d)
+            // "≥" when some scene has no frame time or frame count to go by yet
+            string approx = allKnown ? "≈ " : "≥ ";
+            if (active && current != null)
             {
-                double eta = avg * (t - d);
-                tileEta.Set("≈ " + FormatDuration(eta), string.Format("сцена · к {0:HH:mm, dd.MM}", DateTime.Now.AddSeconds(eta)), Theme.Text);
+                double sceneLeft = JobSecondsLeft(current);
+                if (!othersLeft)
+                    tileEta.Set(sceneLeft > 0 ? "≈ " + FormatDuration(sceneLeft) : "—",
+                        sceneLeft > 0 ? string.Format("к {0:HH:mm, dd.MM}", DateTime.Now.AddSeconds(sceneLeft)) : "", Theme.Text);
+                else
+                    tileEta.Set(queueLeft > 0 ? approx + FormatDuration(queueLeft) : "—",
+                        queueLeft > 0 ? string.Format("всё к {0:HH:mm, dd.MM}", DateTime.Now.AddSeconds(queueLeft))
+                            + (sceneLeft > 0 ? " · сцена " + FormatDuration(sceneLeft) : "") : "", Theme.Text);
             }
+            else if (!queueRunning && queueLeft > 0)
+                tileEta.Set(approx + FormatDuration(queueLeft), string.Format("при старте сейчас — к {0:HH:mm, dd.MM}", DateTime.Now.AddSeconds(queueLeft)), Theme.Text);
             else
                 tileEta.Set("—", "", Theme.Text);
             tileAvg.Set(avg > 0 ? FormatDuration(avg) : "—", last > 0 ? "последний " + FormatDuration(last) : "", Theme.Text);
@@ -2406,6 +2675,65 @@ namespace RenderSolver
             if (tray.Text != tip) tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
             UpdateTaskbar(active ? t : 0, active ? d : 0);
             UpdateJobTitle();
+        }
+
+        // ─── finish time ─────────────────────────────────────────
+
+        double liveFrameSec;                    // average frame of the running render (last 20 frames)
+        double fallbackFrameSec, fallbackLoadSec; // for scenes never rendered: the running render, else the other scenes
+
+        /// <summary>
+        /// Seconds the scene still needs: frames left × frame time (+ Blender's load time if it is not running),
+        /// 0 when it is complete, -1 when there is nothing to go by. Frame time: the running render, else the
+        /// scene's last render, else the fallback.
+        /// </summary>
+        double JobSecondsLeft(Job j)
+        {
+            if (queueRunning && j == current)
+            {
+                int t, d;
+                lock (sync) { t = total; d = done; }
+                double per = liveFrameSec > 0 ? liveFrameSec : j.AvgFrameSec > 0 ? j.AvgFrameSec : fallbackFrameSec;
+                if (t <= 0 || per <= 0) return -1;
+                return per * Math.Max(0, t - d);
+            }
+            if (j.SceneFilepath == null || j.Total <= 0) return -1;
+            // a new Override re-renders everything; once started, only frames saved since then count as done
+            int left = j.Override && j.OverrideSince == 0 ? j.Total : Math.Max(0, j.Total - j.Done);
+            if (left == 0) return 0;
+            double frame = j.AvgFrameSec > 0 ? j.AvgFrameSec : fallbackFrameSec;
+            if (frame <= 0) return -1;
+            return frame * left + (j.LoadSec > 0 ? j.LoadSec : fallbackLoadSec);
+        }
+
+        /// <summary>Seconds for every ticked scene still to render. allKnown = false when some scene could not be
+        /// estimated (its time is missing from the sum); othersLeft = scenes besides the running one have work left.</summary>
+        double QueueSecondsLeft(out bool allKnown, out bool othersLeft)
+        {
+            double sumFrame = 0, sumLoad = 0;
+            int nFrame = 0, nLoad = 0;
+            foreach (Job j in jobs)
+            {
+                if (j.AvgFrameSec > 0) { sumFrame += j.AvgFrameSec; nFrame++; }
+                if (j.LoadSec > 0) { sumLoad += j.LoadSec; nLoad++; }
+            }
+            fallbackFrameSec = liveFrameSec > 0 ? liveFrameSec : nFrame > 0 ? sumFrame / nFrame : 0;
+            fallbackLoadSec = nLoad > 0 ? sumLoad / nLoad : 0;
+
+            allKnown = true;
+            othersLeft = false;
+            double seconds = 0;
+            foreach (Job j in jobs)
+            {
+                if (!j.Enabled) continue;
+                // while running: the current scene and those still waiting; idle: all of them (Start resets them)
+                if (queueRunning && j != current && j.Status != JobStatus.Waiting) continue;
+                double s = JobSecondsLeft(j);
+                if (j != current && s != 0) othersLeft = true;
+                if (s < 0) { allKnown = false; continue; }
+                seconds += s;
+            }
+            return seconds;
         }
 
         void SetStatus(string badgeText, string text, Color badgeColor, Color textColor)
