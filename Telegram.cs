@@ -13,7 +13,7 @@ using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
-namespace RenderCrashSolver
+namespace RenderSolver
 {
     static class TelegramApi
     {
@@ -394,7 +394,7 @@ namespace RenderCrashSolver
                 return;
             }
             btnTest.Enabled = false;
-            string text = "🔔 Тест уведомлений RenderCrashSolver\nКомпьютер: " + Environment.MachineName;
+            string text = "🔔 Тест уведомлений RenderSolver\nКомпьютер: " + Environment.MachineName;
             ThreadPool.QueueUserWorkItem(delegate
             {
                 var errors = new List<string>();

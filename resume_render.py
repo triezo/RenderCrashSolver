@@ -1,9 +1,10 @@
 """
 resume_render.py - resume animation render after a Blender crash.
 
-Called by RenderCrashSolver.exe or run_render.bat via:
+Called by RenderSolver.exe (RenderCrashSolver.exe up to 0.5) or run_render.bat via:
 blender -b file.blend -P resume_render.py [-- --output-dir DIR] [--prefix NAME] [--override-since UNIX_TS] [--frames SPEC]
-blender -b file.blend -P resume_render.py -- --info [--frames SPEC]   (only print SCENE_* lines, no render)
+blender -b file.blend -P resume_render.py -- --info [--frames SPEC] [--output-dir DIR] [--prefix NAME]
+  (only print SCENE_* lines and STATUS, no render; SCENE_PATH is the scene's own path, STATUS counts the custom output)
 
 Logic:
 - Frames: the scene range with the scene's frame step, or --frames "1-100,120,150-200" (exactly those frames;
@@ -251,6 +252,8 @@ def main():
         log(f"SCENE_FRAMES {frame_start} {frame_end} {scene_step}")
         log(f"SCENE_EXT {ext or 'FFMPEG'}")
         if ext:
+            # count the frames where they will actually be written (custom output applied)
+            apply_custom_output(scene, args)
             rendered = find_rendered_frames(get_output_dir(scene), get_frame_pattern(scene, ext), ext,
                                             fix_broken=False) & selection
             log(f"STATUS total={len(selection)} done={len(rendered)} missing={len(selection) - len(rendered)}")

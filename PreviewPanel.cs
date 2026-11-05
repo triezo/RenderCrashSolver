@@ -9,7 +9,7 @@ using System.IO;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
-namespace RenderCrashSolver
+namespace RenderSolver
 {
     class PreviewPanel : UserControl
     {
@@ -137,7 +137,7 @@ namespace RenderCrashSolver
 
         UiButton IconButton(Glyph glyph, string tip, EventHandler click)
         {
-            var b = new UiButton("", glyph, ButtonKind.Ghost) { Margin = Theme.P(0, 0, 2, 0) };
+            var b = new UiButton("", glyph, ButtonKind.Ghost) { Margin = Theme.P(0, 0, 2, 0), AccessibleName = tip.Split('(')[0].Trim() };
             b.Click += click;
             tips.SetToolTip(b, tip);
             return b;

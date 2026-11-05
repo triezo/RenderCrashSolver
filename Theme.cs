@@ -8,7 +8,7 @@ using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
-namespace RenderCrashSolver
+namespace RenderSolver
 {
     static class Theme
     {
@@ -175,6 +175,27 @@ namespace RenderCrashSolver
                         for (int i = 0; i < 3; i++)
                             g.FillEllipse(brush, x + w * (0.14f + 0.31f * i), y + h * 0.42f, w * 0.16f, h * 0.16f);
                         break;
+                    case Glyph.Plus:
+                        g.DrawLine(pen, x + w * 0.5f, y + h * 0.15f, x + w * 0.5f, y + h * 0.85f);
+                        g.DrawLine(pen, x + w * 0.15f, y + h * 0.5f, x + w * 0.85f, y + h * 0.5f);
+                        break;
+                    case Glyph.Up:
+                        g.DrawLines(pen, Pts(b, 0.18f, 0.66f, 0.5f, 0.34f, 0.82f, 0.66f));
+                        break;
+                    case Glyph.Down:
+                        g.DrawLines(pen, Pts(b, 0.18f, 0.34f, 0.5f, 0.66f, 0.82f, 0.34f));
+                        break;
+                    case Glyph.Cross:
+                        g.DrawLine(pen, x + w * 0.22f, y + h * 0.22f, x + w * 0.78f, y + h * 0.78f);
+                        g.DrawLine(pen, x + w * 0.78f, y + h * 0.22f, x + w * 0.22f, y + h * 0.78f);
+                        break;
+                    case Glyph.Duplicate:
+                        pen.Width = Math.Max(1.2f, w * 0.1f);
+                        using (GraphicsPath back = RoundRect(new RectangleF(x + w * 0.1f, y + h * 0.1f, w * 0.55f, h * 0.55f), w * 0.1f))
+                            g.DrawPath(pen, back);
+                        using (GraphicsPath front = RoundRect(new RectangleF(x + w * 0.35f, y + h * 0.35f, w * 0.55f, h * 0.55f), w * 0.1f))
+                            g.DrawPath(pen, front);
+                        break;
                 }
             }
             g.SmoothingMode = old;
@@ -337,7 +358,7 @@ namespace RenderCrashSolver
         }
     }
 
-    enum Glyph { None, Play, Pause, Stop, Prev, Next, Latest, Refresh, Folder, Dots }
+    enum Glyph { None, Play, Pause, Stop, Prev, Next, Latest, Refresh, Folder, Dots, Plus, Up, Down, Cross, Duplicate }
 
     enum LogKind { Event, Frame, Section, Success, Warning, Error }
 
@@ -820,6 +841,78 @@ namespace RenderCrashSolver
             TextRenderer.DrawText(g, value, Theme.Value, new Rectangle(x, y, w, Theme.Value.Height), valueColor, flags);
             y += Theme.Value.Height;
             TextRenderer.DrawText(g, sub, Theme.Small, new Rectangle(x, y, w, Theme.Small.Height), Theme.TextDim, flags);
+        }
+    }
+
+    /// <summary>Two or more tabs in one rounded bar ("Очередь" | "Настройки").</summary>
+    class Segmented : Control
+    {
+        readonly string[] items;
+        int selected, hover = -1;
+        public event EventHandler SelectedIndexChanged;
+
+        public Segmented(params string[] items)
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            this.items = items;
+            Font = Theme.Base;
+            Height = Theme.S(34);
+            Cursor = Cursors.Hand;
+        }
+
+        public int SelectedIndex
+        {
+            get { return selected; }
+            set
+            {
+                if (value == selected || value < 0 || value >= items.Length) return;
+                selected = value;
+                Invalidate();
+                if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty);
+            }
+        }
+
+        Rectangle ItemRect(int i)
+        {
+            int pad = Theme.S(3), w = (Width - 2 * pad) / items.Length;
+            return new Rectangle(pad + i * w, pad, i == items.Length - 1 ? Width - 2 * pad - i * w : w, Height - 2 * pad);
+        }
+
+        int ItemAt(Point p)
+        {
+            for (int i = 0; i < items.Length; i++) if (ItemRect(i).Contains(p)) return i;
+            return -1;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int h = ItemAt(e.Location);
+            if (h != hover) { hover = h; Invalidate(); }
+        }
+
+        protected override void OnMouseLeave(EventArgs e) { hover = -1; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            int i = ItemAt(e.Location);
+            if (i >= 0) SelectedIndex = i;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(Theme.BackOf(this));
+            Theme.Fill(g, Theme.Input, new RectangleF(0, 0, Width, Height), Theme.S(6));
+            for (int i = 0; i < items.Length; i++)
+            {
+                Rectangle r = ItemRect(i);
+                if (i == selected) Theme.Fill(g, Theme.Raised, r, Theme.S(5));
+                else if (i == hover) Theme.Fill(g, Theme.Tile, r, Theme.S(5));
+                TextRenderer.DrawText(g, items[i], i == selected ? Theme.Strong : Font, r, i == selected || i == hover ? Theme.Text : Theme.TextDim,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+            }
         }
     }
 
