@@ -8,12 +8,23 @@ using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Media;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using Timer = System.Windows.Forms.Timer;
+
+// version resource of the exe (Explorer > Properties > Details, Task Manager)
+[assembly: AssemblyTitle(RenderSolver.AppInfo.Name)]
+[assembly: AssemblyProduct(RenderSolver.AppInfo.Name)]
+[assembly: AssemblyDescription("Render queue for Blender with crash auto-resume")]
+[assembly: AssemblyCompany(RenderSolver.AppInfo.Publisher)]
+[assembly: AssemblyCopyright("© " + RenderSolver.AppInfo.Publisher)]
+[assembly: AssemblyVersion(RenderSolver.AppInfo.Version + ".0.0")]
+[assembly: AssemblyFileVersion(RenderSolver.AppInfo.Version + ".0.0")]
+[assembly: AssemblyInformationalVersion(RenderSolver.AppInfo.Version)]
 
 namespace RenderSolver
 {
@@ -23,12 +34,73 @@ namespace RenderSolver
         static extern bool SetProcessDPIAware();
 
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
             try { SetProcessDPIAware(); } catch { }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            if (args.Length > 0 && args[0].Equals("/uninstall", StringComparison.OrdinalIgnoreCase))
+            {
+                Installer.Uninstall(); // "Установленные приложения" > RenderSolver > Удалить
+                return;
+            }
             Application.Run(new MainForm());
+        }
+    }
+
+    /// <summary>
+    /// resume_render.py is built into the exe (one file to share, nothing to lose when it is copied without the script)
+    /// and written out for Blender's -P to %LOCALAPPDATA%\RenderSolver whenever that copy is missing or differs.
+    /// </summary>
+    static class EmbeddedScript
+    {
+        const string ResourceName = "resume_render.py";
+        static byte[] data;
+
+        /// <summary>Where Ensure() last wrote the script.</summary>
+        public static string FilePath { get; private set; }
+        public static string Error { get; private set; }
+
+        public static bool Ensure()
+        {
+            if (data == null)
+            {
+                using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream(ResourceName))
+                {
+                    if (s == null) { Error = "в программу не встроен resume_render.py (соберите её через build.bat)"; return false; }
+                    var ms = new MemoryStream();
+                    s.CopyTo(ms);
+                    data = ms.ToArray();
+                }
+            }
+            foreach (string root in new[] { Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), Path.GetTempPath() })
+            {
+                try
+                {
+                    if (string.IsNullOrEmpty(root)) continue;
+                    string dir = Path.Combine(root, AppInfo.Name), file = Path.Combine(dir, ResourceName);
+                    if (!File.Exists(file) || !SameBytes(File.ReadAllBytes(file), data))
+                    {
+                        Directory.CreateDirectory(dir);
+                        string tmp = file + "." + Process.GetCurrentProcess().Id + ".tmp";
+                        File.WriteAllBytes(tmp, data);
+                        File.Copy(tmp, file, true);
+                        File.Delete(tmp);
+                    }
+                    FilePath = file;
+                    Error = null;
+                    return true;
+                }
+                catch (Exception ex) { Error = ex.Message; }
+            }
+            return false;
+        }
+
+        static bool SameBytes(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
         }
     }
 
@@ -299,8 +371,8 @@ namespace RenderSolver
 
     class MainForm : Form
     {
-        const string AppName = "RenderSolver";
-        const string AppTitle = AppName + " 0.6";
+        const string AppName = AppInfo.Name;
+        const string AppTitle = AppName + " " + AppInfo.Version;
 #if TELEGRAM
         static readonly bool TelegramFeature = true;
 #else
@@ -1538,7 +1610,7 @@ namespace RenderSolver
                 }
                 if (problem == null)
                     problem = !File.Exists(settings.BlenderExe) ? "укажите blender.exe на вкладке «Настройки»"
-                        : !File.Exists(ScriptPath) ? "рядом с программой нет resume_render.py" : null;
+                        : !EmbeddedScript.Ensure() ? "не удалось записать resume_render.py: " + EmbeddedScript.Error : null;
                 if (problem != null)
                 {
                     j.InfoValid = true;
@@ -1840,9 +1912,10 @@ namespace RenderSolver
 
         // ─── queue control ───────────────────────────────────────
 
+        /// <summary>The script copy for Blender; rewritten first if it was deleted or belongs to another version.</summary>
         string ScriptPath
         {
-            get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "resume_render.py"); }
+            get { EmbeddedScript.Ensure(); return EmbeddedScript.FilePath; }
         }
 
         void ReadSettingsFromUi()
@@ -1876,9 +1949,8 @@ namespace RenderSolver
             foreach (Job j in jobs) if (j.Enabled) toRender.Add(j);
             string error = null;
             if (!File.Exists(settings.BlenderExe)) error = "Не найден blender.exe:\n" + settings.BlenderExe + "\n\nУкажите его на вкладке «Настройки».";
-            else if (!File.Exists(ScriptPath))
-                error = "Рядом с программой не найден resume_render.py:\n" + ScriptPath +
-                        "\n\nЕсли программа запущена прямо из zip-архива — распакуйте архив целиком в обычную папку и запустите оттуда.";
+            else if (!EmbeddedScript.Ensure())
+                error = "Не удалось записать служебный скрипт resume_render.py для Blender:\n" + EmbeddedScript.Error;
             else if (jobs.Count == 0) error = "Очередь пуста. Добавьте сцены .blend кнопкой «Добавить» или перетащите их в список.";
             else if (toRender.Count == 0) error = "Ни одна сцена не отмечена галочкой.";
             else

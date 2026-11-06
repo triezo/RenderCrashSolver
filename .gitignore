@@ -13,3 +13,4 @@ Text Document.txt
 
 # python bytecode
 __pycache__/
+obj/

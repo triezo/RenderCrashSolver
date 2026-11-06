@@ -24,13 +24,18 @@
 
 ## Требования
 
-- Windows 10/11 (.NET Framework 4 уже встроен в систему).
+- Windows 10/11. Больше ничего ставить не нужно: программа — один exe на .NET Framework 4, который встроен в Windows 10 и 11, без сторонних библиотек.
 - Blender 2.8+ (проверено на 4.3 и 5.2).
 - Вывод сцены — последовательность кадров (JPG/PNG/EXR…), не видео.
 
-## Использование
+## Установка
 
-Возьмите готовый zip в разделе Releases (если он там есть) или соберите сам через `package.bat` (см. ниже). Распакуйте архив целиком и запустите `RenderSolver.exe`. Подробная инструкция — в [README.txt](README.txt).
+В [Releases](https://github.com/triezo/RenderCrashSolver/releases) два файла:
+
+- **`RenderSolver_Setup_<версия>.exe`** — установщик. Ставит программу только для текущего пользователя (без прав администратора) в `%LOCALAPPDATA%\Programs\RenderSolver`, добавляет ярлык в «Пуск» и, по желанию, на рабочий стол. Обновление — тем же установщиком поверх, очередь и настройки сохраняются. Удаление — в «Параметры → Приложения».
+- **`RenderSolver_<версия>_portable.zip`** — тот же `RenderSolver.exe` без установки: распакуйте в любую папку и запустите. Настройки хранятся рядом с exe.
+
+Подробная инструкция — в [README.txt](README.txt).
 
 ## Сборка
 
@@ -39,7 +44,7 @@
 | Скрипт | Что делает |
 |---|---|
 | `build.bat` | Собирает `RenderSolver.exe` рядом с исходниками (с уведомлениями в Telegram, `/define:TELEGRAM`). |
-| `package.bat` | Собирает тестовую сборку в `dist\RenderSolver\` и zip-архив для раздачи (без Telegram). |
+| `package.bat` | Собирает файлы для релиза в `dist\`: установщик `RenderSolver_Setup_<версия>.exe` и `RenderSolver_<версия>_portable.zip` (без Telegram). Версия берётся из `AppInfo.cs`. |
 
 ## Разработка
 
@@ -54,4 +59,8 @@
 | `PreviewPanel.cs` | Панель просмотра готовых кадров. |
 | `Telegram.cs` | Уведомления через Telegram-бота (в разработке). |
 | `Theme.cs` | Тёмная тема и самописные элементы интерфейса. |
-| `resume_render.py` | Скрипт внутри Blender (`blender -b scene.blend -P resume_render.py`): находит готовые кадры, рендерит недостающие, печатает служебные строки `[resume_render] ...` для окна. |
+| `AppInfo.cs` | Название и версия программы (общие для программы и установщика). |
+| `Installer.cs` | Установка для текущего пользователя и удаление (`RenderSolver.exe /uninstall`): ярлыки, запись в «Приложениях», окно установщика. |
+| `Setup.cs` | Установщик `RenderSolver_Setup_<версия>.exe`, внутри которого лежит `RenderSolver.exe`. |
+| `tools\make_icon.cs` | Рисует `app.ico` для exe из того же кода, что и иконку окна. |
+| `resume_render.py` | Скрипт внутри Blender (`blender -b scene.blend -P resume_render.py`): находит готовые кадры, рендерит недостающие, печатает служебные строки `[resume_render] ...` для окна. Встроен в `RenderSolver.exe`. |

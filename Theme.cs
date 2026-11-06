@@ -246,10 +246,17 @@ namespace RenderSolver
             catch { }
         }
 
-        /// <summary>App icon drawn in code: rounded blue square with a "resume" arrow around a play triangle.</summary>
+        /// <summary>App icon for the window and the tray (app.ico for Explorer is made from the same drawing by tools\make_icon.cs).</summary>
         public static Icon AppIcon(int size)
         {
-            using (var bmp = new Bitmap(size, size))
+            using (Bitmap bmp = AppIconBitmap(size))
+                return Icon.FromHandle(bmp.GetHicon());
+        }
+
+        /// <summary>App icon drawn in code: rounded blue square with a "resume" arrow around a play triangle.</summary>
+        public static Bitmap AppIconBitmap(int size)
+        {
+            var bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
             {
                 using (Graphics g = Graphics.FromImage(bmp))
                 {
@@ -272,7 +279,7 @@ namespace RenderSolver
                         new PointF(c - s * 0.08f, c - s * 0.12f), new PointF(c + s * 0.13f, c), new PointF(c - s * 0.08f, c + s * 0.12f),
                     });
                 }
-                return Icon.FromHandle(bmp.GetHicon());
+                return bmp;
             }
         }
 
